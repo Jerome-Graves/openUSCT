@@ -1,0 +1,45 @@
+{
+  "connector_refs": [],
+  "decoupling_pairs": [],
+  "critical_nets": [],
+  "power_tree_refs": [],
+  "analog_refs": [],
+  "digital_refs": [],
+  "sensor_cluster_refs": [],
+  "rf_keepout_regions": [],
+  "manufacturer": "JLCPCB",
+  "manufacturer_tier": "standard",
+  "functional_spacing_mm": 5.0,
+  "thermal_hotspots": [],
+  "critical_frequencies_mhz": [
+    65.0,
+    125.0,
+    250.0
+  ],
+  "power_rails": [],
+  "interfaces": [],
+  "mechanical": {
+    "outline_dxf_path": "",
+    "board_width_mm": null,
+    "board_height_mm": null,
+    "mount_holes": [],
+    "connector_placement": [],
+    "max_height_mm": null,
+    "enclosure_step_path": "",
+    "notes": ""
+  },
+  "compliance": [],
+  "cost": {
+    "unit_cost_usd_max": null,
+    "volume_units": 1,
+    "nre_budget_usd": null,
+    "prefer_jlcpcb_basic_parts": false
+  },
+  "thermal": {
+    "ambient_c": 25.0,
+    "max_component_c": 85.0,
+    "airflow": "natural",
+    "ambient_airflow_m_s": null,
+    "thermal_resistance_target_c_per_w": null
+  }
+}

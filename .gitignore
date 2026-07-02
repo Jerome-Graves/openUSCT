@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated data
+*.h5
+
+# RTL simulation artifacts
+*.hex
+*.vvp
+*.vcd
+hardware/fpga/sim/out.txt
+hardware/fpga/sim/das.out
+
+# C++ / native build artifacts
+build/
+*.pyd
+*.mexw64
+*.obj
+*.exp
+*.lib
+*.o
+*.so
+
+# OS / editor
+.DS_Store
+.vscode/
+*.swp
