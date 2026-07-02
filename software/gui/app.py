@@ -44,21 +44,28 @@ from ringfwi.uarp_format import to_uarp_set
 
 # Self-heal a stale server: Streamlit re-reads this script on every rerun but
 # keeps imported modules cached, so a server started before a library change
-# serves old modules (locally AND on Streamlit Cloud redeploys). If any
-# required symbol is missing, purge and re-import. NOTE: when the library
-# grows a feature this app depends on, add a sentinel for it here.
-if not (hasattr(anisotropy, "TI_MATERIALS") and hasattr(td, "transmit_chain")
-        and hasattr(render3d, "polycrystal_figure")
-        and hasattr(fwi, "GSOT_ETA") and hasattr(fwi, "p_window_weights")):
-    import importlib
+# serves old modules (locally AND on Streamlit Cloud redeploys). The check is
+# self-maintaining: the loaded package remembers the source mtime it was
+# imported at; if the files on disk are newer, purge and re-import.
+import ringfwi as _rw
+
+_lib_dir = os.path.dirname(os.path.abspath(_rw.__file__))
+try:
+    _lib_mtime = max(os.path.getmtime(os.path.join(_lib_dir, _f))
+                     for _f in os.listdir(_lib_dir) if _f.endswith(".py"))
+except OSError:
+    _lib_mtime = 0.0
+if getattr(_rw, "_loaded_mtime", None) not in (None, _lib_mtime):
     for _name in [m for m in list(sys.modules)
                   if m == "ringfwi" or m.startswith("ringfwi.")]:
         del sys.modules[_name]
+    import ringfwi as _rw
     from ringfwi import anisotropy, elastic3d, fwi, imaging, phantom, render3d
     from ringfwi import transducer as td
     from ringfwi.dataset import ArrayGeometry, Dataset
     from ringfwi.geometry import CylinderArray, build_footprints
     from ringfwi.uarp_format import to_uarp_set
+_rw._loaded_mtime = _lib_mtime
 
 import hw_cosim
 import webgpu_client
