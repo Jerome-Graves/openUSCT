@@ -27,6 +27,8 @@ are designed as one system:
   The whole app runs client-side (Python compiled to WebAssembly); on Chrome
   or Edge the acoustic acquisition executes on **your GPU via WebGPU**, with a
   live parity check against the CPU reference.
+* **Hosted demo (no install, server-side):**
+  [open-usct.streamlit.app](https://open-usct.streamlit.app/).
 * **Locally, at full speed** (C++ core, CUDA if available):
 
 ```bash
