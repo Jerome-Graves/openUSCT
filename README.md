@@ -23,7 +23,7 @@ are designed as one system:
 ## Try it
 
 * **In your browser, on your machine:**
-  [jerome-graves.github.io/openUSCT](https://jerome-graves.github.io/openUSCT/).
+  [jeromegraves.com/openUSCT](https://jeromegraves.com/openUSCT/).
   The whole app runs client-side (Python compiled to WebAssembly); on Chrome
   or Edge the acoustic acquisition executes on **your GPU via WebGPU**, with a
   live parity check against the CPU reference.
