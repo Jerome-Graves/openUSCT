@@ -1113,7 +1113,7 @@ with tab_fwi:
 
         if poly:
             st.divider()
-            st.subheader("Grain-orientation (COF) inversion")
+            st.subheader("Grain-orientation (COF) inversion (from known geometry)")
             st.caption("Solves for what the polycrystal actually is: the 3D c-axis "
                        "of every grain, with the full elastic forward and the known "
                        "grain geometry and material (velocity never appears in the "
