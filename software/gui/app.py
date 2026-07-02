@@ -42,10 +42,10 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "simulation"))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))
 
-from ringfwi import anisotropy, elastic3d, fwi, imaging, phantom, render3d
+from ringfwi import anisotropy, cof, elastic3d, fwi, imaging, phantom, render3d
 from ringfwi import transducer as td
 from ringfwi.dataset import ArrayGeometry, Dataset
-from ringfwi.geometry import CylinderArray, build_footprints
+from ringfwi.geometry import CylinderArray, build_footprints, _fibonacci_directions
 from ringfwi.uarp_format import to_uarp_set
 
 # Self-heal a stale server: Streamlit re-reads this script on every rerun but
@@ -66,10 +66,10 @@ if getattr(_rw, "_loaded_mtime", None) not in (None, _lib_mtime):
                   if m == "ringfwi" or m.startswith("ringfwi.")]:
         del sys.modules[_name]
     import ringfwi as _rw
-    from ringfwi import anisotropy, elastic3d, fwi, imaging, phantom, render3d
+    from ringfwi import anisotropy, cof, elastic3d, fwi, imaging, phantom, render3d
     from ringfwi import transducer as td
     from ringfwi.dataset import ArrayGeometry, Dataset
-    from ringfwi.geometry import CylinderArray, build_footprints
+    from ringfwi.geometry import CylinderArray, build_footprints, _fibonacci_directions
     from ringfwi.uarp_format import to_uarp_set
 _rw._loaded_mtime = _lib_mtime
 
@@ -1107,3 +1107,195 @@ with tab_fwi:
                                height=280, margin=dict(l=10, r=10, t=40, b=10))
             st.plotly_chart(figm, width="stretch")
             st.success(f"Misfit reduced to {hist[-1]/hist[0]*100:.1f}% of initial")
+
+        if poly:
+            st.divider()
+            st.subheader("Grain-orientation (COF) inversion")
+            st.caption("Solves for what the polycrystal actually is: the 3D c-axis "
+                       "of every grain, with the full elastic forward and the known "
+                       "grain geometry and material (velocity never appears in the "
+                       "parameter vector). Coarse hemisphere search per grain, then "
+                       "Levenberg-Marquardt Jacobian iterations.")
+            G = len(axes3)
+            co1, co2, co3, co4 = st.columns(4)
+            with co1:
+                cof_tx = st.slider("Transmits used", 2, len(src_list),
+                                   min(4, len(src_list)), key="cof_tx")
+            with co2:
+                cof_dirs = st.slider("Coarse directions", 8, 24, 16, key="cof_dirs",
+                     help="16+ keeps every grain within the Jacobian iterations' convergence basin; fewer is faster but can strand a grain.")
+            with co3:
+                cof_sweeps = st.slider("Coarse sweeps", 1, 2, 2, key="cof_sweeps")
+            with co4:
+                cof_lm = st.slider("Jacobian iterations", 0, 6, 3, key="cof_lm")
+            est = 1 + cof_sweeps * G * cof_dirs + cof_lm * (3 + 2 * G)
+            st.caption(f"About {est} forward evaluations of {cof_tx} transmits each "
+                       f"({G} grains). Fewer grains in the Sample tab = much faster.")
+
+            _cof_sig = (n, nt, G, int(seed), cof_tx, cof_dirs, cof_sweeps, cof_lm,
+                        tuple(src_list))
+            if st.button("Recover grain orientations", type="primary",
+                         disabled="cof_job" in st.session_state, key="cof_btn"):
+                sel = np.linspace(0, len(src_list) - 1, cof_tx).astype(int)
+                st.session_state.cof_job = dict(
+                    sig=_cof_sig, t0=time.time(), evals=0, est=est,
+                    tx_sel=[int(i) for i in dict.fromkeys(sel)],
+                    phase="init", axes=np.tile([0.0, 0.0, 1.0], (G, 1)),
+                    j_cur=None, sweep=0, grain=0, diri=0,
+                    best_j=None, best_a=None, hist=[],
+                    lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
+                            J=None, Jac=None, col=0, trial=0))
+                st.session_state.pop("cof_result", None)
+                st.rerun()
+
+            cjob = st.session_state.get("cof_job")
+            if cjob is not None and cjob["sig"] != _cof_sig:
+                del st.session_state.cof_job
+                js_progress(done=True)
+                st.warning("Configuration changed during the COF inversion; run aborted.")
+                cjob = None
+            if cjob is not None:
+                ds = st.session_state.ds
+                src_sub = [src_list[i] for i in cjob["tx_sel"]]
+                dobs_sub = ds.data[cjob["tx_sel"]]
+                residual = cof.make_residual(
+                    labels, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
+                    material=material,
+                    filter_fn=lambda d: apply_rx_filter(d, axis=1))
+
+                def Jof(axes_or_p, is_params=False):
+                    p_ = axes_or_p if is_params else cof.params_from_axes(axes_or_p)
+                    r_ = residual(np.asarray(p_))
+                    return 0.5 * float(r_ @ r_), r_
+
+                frac = cjob["evals"] / max(cjob["est"], 1)
+                el = time.time() - cjob["t0"]
+                eta = el / max(cjob["evals"], 1) * max(cjob["est"] - cjob["evals"], 0)
+                msg = (f"COF inversion [{cjob['phase']}]: evaluation "
+                       f"{cjob['evals'] + 1}/~{cjob['est']}"
+                       + (f" ({el:.0f}s elapsed, ~{eta:.0f}s remaining)"
+                          if cjob["evals"] else " ..."))
+                js_progress(min(frac, 1.0), msg)
+                if not IN_BROWSER:
+                    st.progress(min(frac, 1.0), text=msg)
+
+                hemi = [d if d[2] >= 0 else -d
+                        for d in _fibonacci_directions(cof_dirs, hemisphere=True)]
+                done = False
+                if cjob["phase"] == "init":
+                    J0, _ = Jof(cjob["axes"])
+                    cjob["j_cur"] = J0
+                    cjob["hist"].append(J0)
+                    cjob["best_j"], cjob["best_a"] = J0, cjob["axes"][0].copy()
+                    cjob["phase"] = "coarse"
+                elif cjob["phase"] == "coarse":
+                    g_i, d_i = cjob["grain"], cjob["diri"]
+                    axes_try = cjob["axes"].copy()
+                    axes_try[g_i] = hemi[d_i]
+                    Jt, _ = Jof(axes_try)
+                    if Jt < cjob["best_j"]:
+                        cjob["best_j"], cjob["best_a"] = Jt, np.array(hemi[d_i])
+                    cjob["diri"] += 1
+                    if cjob["diri"] >= cof_dirs:
+                        cjob["axes"][g_i] = cjob["best_a"]
+                        cjob["j_cur"] = cjob["best_j"]
+                        cjob["hist"].append(cjob["j_cur"])
+                        cjob["diri"] = 0
+                        cjob["grain"] += 1
+                        if cjob["grain"] >= G:
+                            cjob["grain"] = 0
+                            cjob["sweep"] += 1
+                            if cjob["sweep"] >= cof_sweeps:
+                                if cof_lm > 0:
+                                    cjob["phase"] = "lm"
+                                    cjob["lm"]["p"] = cof.params_from_axes(
+                                        cjob["axes"]).ravel()
+                                else:
+                                    done = True
+                        cjob["best_j"] = cjob["j_cur"]
+                        cjob["best_a"] = cjob["axes"][cjob["grain"] % G].copy()
+                else:                                   # Levenberg-Marquardt
+                    lm = cjob["lm"]
+                    fd = np.radians(2.0)
+                    if lm["sub"] == "base":
+                        lm["J"], lm["r"] = Jof(lm["p"], is_params=True)
+                        cjob["hist"].append(lm["J"])
+                        lm["Jac"] = np.empty((lm["r"].size, lm["p"].size))
+                        lm["sub"] = "col"
+                        lm["col"] = 0
+                    elif lm["sub"] == "col":
+                        k = lm["col"]
+                        pk = lm["p"].copy()
+                        pk[k] += fd
+                        _, rk = Jof(pk, is_params=True)
+                        lm["Jac"][:, k] = (rk - lm["r"]) / fd
+                        lm["col"] += 1
+                        if lm["col"] >= lm["p"].size:
+                            lm["sub"] = "trial"
+                            lm["trial"] = 0
+                    else:                               # trial step at current lam
+                        Jc = lm["Jac"]
+                        gv = Jc.T @ lm["r"]
+                        Hm = Jc.T @ Jc
+                        step = np.linalg.solve(
+                            Hm + lm["lam"] * np.diag(np.diag(Hm) + 1e-30), -gv)
+                        p_try = lm["p"] + step
+                        J_try, _ = Jof(p_try, is_params=True)
+                        if J_try < lm["J"]:
+                            lm["p"] = p_try
+                            lm["lam"] = max(lm["lam"] / 3.0, 1e-8)
+                            lm["it"] += 1
+                            lm["sub"] = "base"
+                            if lm["it"] >= cof_lm:
+                                cjob["axes"] = cof.axes_from_params(lm["p"])
+                                done = True
+                        else:
+                            lm["lam"] *= 5.0
+                            lm["trial"] += 1
+                            if lm["trial"] >= 5:        # stalled: accept current
+                                cjob["axes"] = cof.axes_from_params(lm["p"])
+                                done = True
+                cjob["evals"] += 1
+                if not done:
+                    st.rerun()
+                js_progress(done=True)
+                axes_rec = np.asarray(cjob["axes"])
+                errs = [cof.axis_error_deg(axes_rec[k], axes3[k])
+                        for k in range(G)]
+                st.session_state.cof_result = dict(
+                    axes=axes_rec, errs=errs, hist=list(cjob["hist"]),
+                    evals=cjob["evals"], secs=time.time() - cjob["t0"])
+                del st.session_state.cof_job
+
+            cres = st.session_state.get("cof_result")
+            if cres is not None:
+                errs = cres["errs"]
+                st.success(f"Recovered {G} grain orientations in {cres['evals']} "
+                           f"evaluations ({cres['secs']:.0f}s): mean axis error "
+                           f"{np.mean(errs):.1f} deg, max {np.max(errs):.1f} deg")
+                rows = ["| grain | true axis | recovered | error |",
+                        "|---|---|---|---|"]
+                for k in range(G):
+                    rows.append(f"| {k} | {np.round(axes3[k], 2)} | "
+                                f"{np.round(cres['axes'][k], 2)} | "
+                                f"{errs[k]:.1f} deg |")
+                st.markdown("\n".join(rows))
+                colat_t = np.degrees(np.arccos(np.clip(np.abs(axes3[:, 2]), 0, 1)))
+                colat_r = np.degrees(np.arccos(
+                    np.clip(np.abs(cres["axes"][:, 2]), 0, 1)))
+                cta, ctb = st.columns(2)
+                with cta:
+                    st.plotly_chart(render3d.polycrystal_figure(
+                        labels, colat_t, h, "True c-axis colatitude",
+                        vmin=0, vmax=90), width="stretch")
+                with ctb:
+                    st.plotly_chart(render3d.polycrystal_figure(
+                        labels, colat_r, h, "Recovered colatitude",
+                        vmin=0, vmax=90), width="stretch")
+                import plotly.graph_objects as go
+                fh = go.Figure(go.Scatter(y=cres["hist"], mode="lines+markers"))
+                fh.update_yaxes(type="log", title="misfit")
+                fh.update_layout(title="COF inversion convergence",
+                                 xaxis_title="accepted update", height=260,
+                                 margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fh, width="stretch")
