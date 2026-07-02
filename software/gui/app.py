@@ -85,7 +85,9 @@ try:
 except Exception:
     GPU_BACKEND = None
 
-st.set_page_config(page_title="OpenUSCT Studio", layout="wide")
+_icon = os.path.join(HERE, "..", "..", "docs", "logo-192.png")
+st.set_page_config(page_title="OpenUSCT Studio", layout="wide",
+                   page_icon=_icon if os.path.exists(_icon) else "🌊")
 st.title("OpenUSCT Studio")
 st.caption(f"3D cylindrical-array ultrasound acquisition and reconstruction, pure Python. Backend: {BACKEND_NAME}.")
 

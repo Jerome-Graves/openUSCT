@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>OpenUSCT</title>
+  <desc>The OpenUSCT mark: the cusped quasi-shear wavefront of an anisotropic solid inside a transducer ring.</desc>
+  <g transform="translate(256,256)">
+    <circle cx="0" cy="0" r="226" fill="none" stroke="#2f7fb8" stroke-width="30"/>
+    <path d="M 0 -168 C 20 -58 58 -20 168 0 C 58 20 20 58 0 168 C -20 58 -58 20 -168 0 C -58 -20 -20 -58 0 -168 Z"
+          fill="#54a8d6" stroke="#1b4f72" stroke-width="10" stroke-linejoin="round"/>
+    <circle cx="0" cy="0" r="30" fill="#eaf4fa"/>
+  </g>
+</svg>

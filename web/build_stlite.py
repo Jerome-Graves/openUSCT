@@ -34,6 +34,8 @@ TEMPLATE = """<!doctype html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
   <title>OpenUSCT Studio (in-browser)</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="alternate icon" href="favicon.ico" />
   <link rel="stylesheet"
         href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.86.0/build/stlite.css" />
   <style>

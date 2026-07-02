@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="130" alt="OpenUSCT logo"></p>
+
 # OpenUSCT
 
 **Open ultrasound computed tomography: full-waveform imaging across hardware,
