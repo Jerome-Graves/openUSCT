@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>OpenUSCT</title>
+  <g transform="translate(256,256)">
+    <circle cx="0" cy="0" r="216" fill="none" stroke="#2f7fb8" stroke-width="52"/>
+    <path d="M 0 -160 C 22 -56 56 -22 160 0 C 56 22 22 56 0 160 C -22 56 -56 22 -160 0 C -56 -22 -22 -56 0 -160 Z"
+          fill="#54a8d6" stroke="#1b4f72" stroke-width="14" stroke-linejoin="round"/>
+    <circle cx="0" cy="0" r="34" fill="#eaf4fa"/>
+  </g>
+</svg>
