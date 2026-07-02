@@ -332,6 +332,206 @@ def misfit_and_gradient(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list
     return J, g
 
 
+# ---------------------------------------------------------------------------
+# Gauss-Newton ("Jacobian iteration") machinery for voxel FWI.
+#
+# At voxel scale the Jacobian cannot be formed column-by-column, but it can be
+# APPLIED matrix-free: J v is the Born (linearised) forward, J^T w is the
+# existing exact adjoint. The Gauss-Newton system (J^T J + mu I) dm = -g is
+# then solved with conjugate gradients — truncated Gauss-Newton FWI, the
+# operator form of the reduced-model Jacobian iteration.
+#
+# The Born source is the EXACT discrete linearisation of the leapfrog scheme:
+# differentiating p^n = 2p^{n-1} - p^{n-2} + (dt^2/m)(L p^{n-1} + f) in m
+# along v gives  dp^n = 2dp^{n-1} - dp^{n-2} + (dt^2/m) L dp^{n-1}
+#                      - (v/m)(U^n - 2U^{n-1} + U^{n-2}).
+# ---------------------------------------------------------------------------
+
+def _born_forward(m, h, dt, nt, U, v, rec_idx, sponge=None, rec_groups=None):
+    """Exact discrete linearised forward: data perturbation J.v for one source.
+
+    ``U`` is the stored background wavefield history of that source.
+    """
+    shape = m.shape
+    inv_h2 = 1.0 / (h * h)
+    S = (dt * dt) / m
+    vm = v / m
+
+    dp_prev = np.zeros(shape)
+    dp_cur = np.zeros(shape)
+    lap = np.zeros(shape)
+    n_rx = len(rec_groups) if rec_groups is not None else len(rec_idx)
+    rec = np.zeros((nt, n_rx))
+
+    for n in range(1, nt):
+        _laplacian(dp_cur, inv_h2, lap)
+        d2U = U[n] - 2.0 * U[n - 1] + (U[n - 2] if n >= 2 else 0.0)
+        dp_new = 2.0 * dp_cur - dp_prev + S * lap - vm * d2U
+        if sponge is not None:
+            dp_new *= sponge
+        dp_prev, dp_cur = dp_cur, dp_new
+        if rec_groups is not None:
+            for j, (idxs, w) in enumerate(rec_groups):
+                rec[n, j] = sum(wi * dp_cur[ix] for ix, wi in zip(idxs, w))
+        else:
+            for j, idx in enumerate(rec_idx):
+                rec[n, j] = dp_cur[idx]
+    return rec
+
+
+def _adjoint_apply(m, h, dt, nt, U, res, rec_idx, sponge=None, rec_groups=None):
+    """Exact adjoint J^T res for one source, given its background history U."""
+    shape = m.shape
+    inv_h2 = 1.0 / (h * h)
+    S = (dt * dt) / m
+    g = np.zeros(shape)
+    lap = np.zeros(shape)
+    lam_p1 = np.zeros(shape)
+    lam_p2 = np.zeros(shape)
+    for k in range(nt - 1, 0, -1):
+        _laplacian(S * lam_p1, inv_h2, lap)
+        lam_k = 2.0 * lam_p1 - lam_p2 + lap
+        if sponge is not None:
+            lam_k *= sponge
+        if rec_groups is not None:
+            for j, (idxs, w) in enumerate(rec_groups):
+                for ix, wi in zip(idxs, w):
+                    lam_k[ix] -= res[k, j] * wi
+        else:
+            for j, idx in enumerate(rec_idx):
+                lam_k[idx] -= res[k, j]
+        d2p = U[k] - 2.0 * U[k - 1] + (U[k - 2] if k >= 2 else 0.0)
+        g += lam_k * d2p
+        lam_p2 = lam_p1
+        lam_p1 = lam_k
+    return g / m
+
+
+def gn_hessian_vector(m, geom, wavelet, dt, h, nt, v, sponge=None,
+                      src_list=None, footprints=None, wavefields=None):
+    """Gauss-Newton Hessian-vector product (J^T J) v, summed over sources.
+
+    ``wavefields`` optionally supplies precomputed background histories (one
+    per source) to avoid re-running the background forward on every call.
+    """
+    if src_list is None:
+        src_list = list(range(geom.n_elements))
+    else:
+        src_list = list(src_list)
+    rec_idx = None if footprints is not None else geom.idx
+    out = np.zeros_like(m)
+    for i, s in enumerate(src_list):
+        if wavefields is not None:
+            U = wavefields[i]
+        else:
+            _, U = _forward(m, h, dt, nt, _tx_sources(geom, s, wavelet, footprints),
+                            None, sponge, store=True)
+        dd = _born_forward(m, h, dt, nt, U, v, rec_idx, sponge, footprints)
+        out += _adjoint_apply(m, h, dt, nt, U, dd, rec_idx, sponge, footprints)
+    return out
+
+
+def _invert_gauss_newton(m0, geom, wavelet, dt, h, nt, dobs, sponge, src_list,
+                         n_iter, update_mask, m_bounds, n_linesearch, verbose,
+                         progress, footprints, n_cg, gn_damp):
+    """Truncated Gauss-Newton FWI (L2): CG on (J^T J + mu I) dm = -g.
+
+    Each outer iteration costs roughly (2 + 2*n_cg) wave solves per source
+    (about n_cg times a gradient-descent iteration), but the curvature-aware
+    step converges in far fewer outer iterations.
+    """
+    if src_list is None:
+        src_list = list(range(geom.n_elements))
+    else:
+        src_list = list(src_list)
+    m = m0.copy()
+    eff_lo = eff_hi = None
+    if m_bounds is not None:
+        eff_lo = np.minimum(m_bounds[0], m0)
+        eff_hi = np.maximum(m_bounds[1], m0)
+    mask = update_mask if update_mask is not None else 1.0
+    history = []
+
+    # Cache background wavefields for the CG loop when memory allows.
+    cache_bytes = len(src_list) * nt * m.size * 8
+    use_cache = cache_bytes < 4e8
+
+    for it in range(n_iter):
+        J, g = misfit_and_gradient(m, geom, wavelet, dt, h, nt, dobs, sponge,
+                                   src_list, "l2", footprints)
+        history.append(J)
+        if verbose:
+            print(f"  GN iter {it:2d}  misfit = {J:.6e}")
+
+        gm = g * mask
+        if float(np.max(np.abs(gm))) == 0.0:
+            break
+
+        wavefields = None
+        if use_cache:
+            wavefields = []
+            for s in src_list:
+                _, U = _forward(m, h, dt, nt,
+                                _tx_sources(geom, s, wavelet, footprints),
+                                None, sponge, store=True)
+                wavefields.append(U)
+
+        def A(x):
+            hv = gn_hessian_vector(m, geom, wavelet, dt, h, nt, x * mask,
+                                   sponge, src_list, footprints, wavefields)
+            return hv * mask
+
+        # Damping scaled by the Rayleigh quotient of the gradient direction.
+        Hg = A(gm)
+        mu = gn_damp * float(gm.ravel() @ Hg.ravel()) / (float(gm.ravel() @ gm.ravel()) + 1e-300)
+
+        # Conjugate gradients on (A + mu I) p = -gm.
+        b = -gm
+        x = np.zeros_like(m)
+        r = b.copy()
+        d = r.copy()
+        rs = float(r.ravel() @ r.ravel())
+        rs0 = rs
+        for _cg in range(n_cg):
+            Ad = A(d) + mu * d
+            alpha = rs / (float(d.ravel() @ Ad.ravel()) + 1e-300)
+            x += alpha * d
+            r -= alpha * Ad
+            rs_new = float(r.ravel() @ r.ravel())
+            if rs_new < 1e-10 * rs0:
+                break
+            d = r + (rs_new / rs) * d
+            rs = rs_new
+
+        # Backtracking line search along the Gauss-Newton step.
+        step = 1.0
+        accepted = False
+        for _ls in range(n_linesearch):
+            m_try = m + step * x
+            if m_bounds is not None:
+                clipped = np.clip(m_try, eff_lo, eff_hi)
+                m_try = (np.where(update_mask > 0, clipped, m_try)
+                         if update_mask is not None else clipped)
+            J_try = misfit(m_try, geom, wavelet, dt, h, nt, dobs, sponge,
+                           src_list, "l2", footprints)
+            if J_try < J:
+                accepted = True
+                break
+            step *= 0.5
+        if not accepted:
+            if verbose:
+                print("  GN line search failed to reduce misfit; stopping")
+            break
+        m = m_try
+        if progress is not None:
+            progress(it + 1, n_iter)
+
+    J_final = misfit(m, geom, wavelet, dt, h, nt, dobs, sponge, src_list,
+                     "l2", footprints)
+    history.append(J_final)
+    return m, history
+
+
 def invert(
     m0,
     geom,
@@ -354,6 +554,9 @@ def invert(
     footprints=None,
     progress=None,
     time_weights=None,
+    optimizer="gd",
+    n_cg=8,
+    gn_damp=1e-2,
 ):
     """Preconditioned steepest-descent FWI with a backtracking line search.
 
@@ -367,9 +570,26 @@ def invert(
     ``progress`` is an optional callback called as ``progress(done, total)``
     after each completed iteration (for GUI progress reporting).
 
+    ``optimizer``: "gd" (preconditioned steepest descent, default) or
+    "gauss-newton" (truncated Gauss-Newton "Jacobian iteration": conjugate
+    gradients on matrix-free (J^T J + mu I) dm = -g with the exact discrete
+    Born linearisation; L2 misfit only; ~n_cg times the cost per outer
+    iteration but curvature-aware steps).
+
     Returns (m, history) where ``history`` is the misfit per accepted iteration.
     """
     from scipy.ndimage import gaussian_filter
+
+    if optimizer in ("gauss-newton", "gn"):
+        if misfit_type != "l2":
+            raise ValueError("Gauss-Newton is defined for the L2 misfit; "
+                             "select misfit_type='l2'.")
+        if time_weights is not None:
+            raise ValueError("Gauss-Newton does not support time_weights yet.")
+        return _invert_gauss_newton(m0, geom, wavelet, dt, h, nt, dobs, sponge,
+                                    src_list, n_iter, update_mask, m_bounds,
+                                    n_linesearch, verbose, progress, footprints,
+                                    n_cg, gn_damp)
 
     if (footprints is None and time_weights is None and backend is not None
             and misfit_type in ("l2", "gcn")):

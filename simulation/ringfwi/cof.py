@@ -38,14 +38,19 @@ def params_from_axes(axes):
     return np.column_stack([th, ph])
 
 
-def fmc(labels, axes, ring, h, dt, nt, wavelet, src_list, material=None):
-    """Elastic full-matrix capture for a polycrystal with the given axes."""
+def fmc(labels, axes, ring, h, dt, nt, wavelet, src_list, material=None,
+        device="auto"):
+    """Elastic full-matrix capture for a polycrystal with the given axes.
+
+    ``device="auto"`` runs on the GPU (CuPy, float32) for grids large enough
+    to benefit; pass "cpu" for the float64 reference.
+    """
     Cm, rho = _an.polycrystal_stiffness_3d(labels, axes, material=material)
     data = np.zeros((len(src_list), nt, ring.n_elements))
     for i, s in enumerate(src_list):
         rec, _ = _e3d.forward(Cm, rho, h, dt, nt, ring.element_index(s),
                               wavelet, ring.idx, source="explosive",
-                              record="pressure")
+                              record="pressure", device=device)
         data[i] = rec
     return data
 

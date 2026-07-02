@@ -186,7 +186,10 @@ def forward_fmc(m, geom, wavelet, dt, h, nt, sponge=None, src_list=None):
     return cp.asnumpy(data)
 
 
-def misfit_and_gradient(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list=None):
+def misfit_and_gradient(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list=None,
+                        misfit_type="l2"):
+    if misfit_type != "l2":
+        raise NotImplementedError("GPU backend implements the L2 misfit only")
     m = cp.asarray(m, DTYPE)
     wav = cp.asarray(wavelet, DTYPE)
     dobs = cp.asarray(dobs, DTYPE)
@@ -221,7 +224,10 @@ def misfit_and_gradient(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list
     return J, np.asarray(cp.asnumpy(g), dtype=np.float64)
 
 
-def misfit(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list=None):
+def misfit(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list=None,
+           misfit_type="l2"):
+    if misfit_type != "l2":
+        raise NotImplementedError("GPU backend implements the L2 misfit only")
     dsyn = forward_fmc(m, geom, wavelet, dt, h, nt, src_list=src_list)
     r = dsyn - dobs
     return 0.5 * float(np.sum(r * r))

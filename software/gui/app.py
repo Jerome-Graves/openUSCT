@@ -61,12 +61,22 @@ if not (hasattr(anisotropy, "TI_MATERIALS") and hasattr(td, "transmit_chain")
     from ringfwi.uarp_format import to_uarp_set
 
 import hw_cosim
+import webgpu_client
 
 try:
     import uap as _backend
     BACKEND, BACKEND_NAME = _backend, "C++ (libuap)"
 except Exception:
     BACKEND, BACKEND_NAME = fwi, "Python"
+try:
+    import uap_gpu as _gpu_backend                     # CuPy; needs a CUDA GPU
+    # NOTE: assignment, not a bare expression — Streamlit "magic" renders bare
+    # module-level expressions onto the page.
+    _touch = _gpu_backend.forward_fmc
+    GPU_BACKEND = _gpu_backend
+    BACKEND_NAME = BACKEND_NAME + " + GPU (CuPy)"
+except Exception:
+    GPU_BACKEND = None
 
 st.set_page_config(page_title="OpenUSCT Studio", layout="wide")
 st.title("OpenUSCT Studio")
@@ -92,8 +102,10 @@ with tab_arr:
             st.caption("A single ring sits on the mid-plane; axial span does not apply.")
     with ca2:
         st.subheader("Grid & sampling")
-        n_grid = st.slider("Grid points per axis", 28, 60, 34, 2,
-                           help="Finer grid = more accurate but slower (cubic cost in 3D).")
+        n_grid = st.slider("Grid points per axis", 28, 72, 34, 2,
+                           help="Finer grid = more accurate but slower (cubic cost "
+                                "in 3D). Polycrystal runs use the GPU automatically "
+                                "above ~35 points when CuPy is available.")
         nt = st.slider("Samples (nt)", 150, 900, 220, 10)
 
     ct1, ct2 = st.columns(2)
@@ -313,31 +325,60 @@ else:
     vlo, vhi = (min(flaw_c, c_spec) - 100 if flaw_on else c_coup), c_spec + 100
 
 
-def run_acquisition(m, progress=None):
-    """Full-matrix capture with the sample's physics, one transmit at a time.
+def _in_browser():
+    try:
+        import js  # noqa: F401  (exists only under Pyodide/stlite)
+        return True
+    except Exception:
+        return False
 
-    ``progress(done, total, elapsed_s)`` is called after each transmit so the
-    GUI can show completion and an expected time remaining.
+
+IN_BROWSER = _in_browser()
+
+
+def js_progress(frac=0.0, text="", done=False):
+    """Post progress to the client-side widget (browser build only).
+
+    In stlite the Python worker can block the UI, so progress is rendered by
+    a JS widget on the main thread, fed through a BroadcastChannel — messages
+    queued before a heavy computation still paint while Python is busy.
     """
-    data = np.zeros((len(src_list), nt, n_elem))
-    t0 = time.time()
-    for i, s in enumerate(src_list):
-        if poly:                          # full 3D anisotropic elastic
-            src_pts = (list(zip(footprints[s][0], footprints[s][1]))
-                       if footprints is not None else None)
-            rec, _ = elastic3d.forward(Cmaps3, rho_map3, h, dt, nt,
-                                       ring.element_index(s), wavelet, ring.idx,
-                                       source="explosive", record="pressure",
-                                       src_pts=src_pts, rec_groups=footprints)
-            data[i] = rec
-        elif footprints is not None:
-            data[i] = fwi.forward_fmc(m, ring, wavelet, dt, h, nt, src_list=[s],
-                                      footprints=footprints)[0]
-        else:
-            data[i] = BACKEND.forward_fmc(m, ring, wavelet, dt, h, nt, src_list=[s])[0]
-        if progress is not None:
-            progress(i + 1, len(src_list), time.time() - t0)
-    return data
+    if not IN_BROWSER:
+        return
+    import json as _json
+    import js
+    js.eval("globalThis.__ouProgChan = globalThis.__ouProgChan || "
+            "new BroadcastChannel('ou_progress')")
+    payload = {"done": True} if done else {"frac": float(frac), "text": str(text)}
+    js.eval(f"globalThis.__ouProgChan.postMessage({_json.dumps(payload)})")
+
+
+_PROGRESS_WIDGET = """
+<div id="w" style="display:none;font-family:sans-serif;padding-top:6px;">
+  <div style="background:#31333f;border-radius:4px;height:10px;width:100%;">
+    <div id="f" style="background:#ff4b4b;height:10px;border-radius:4px;width:0%;
+                       transition:width 0.2s;"></div>
+  </div>
+  <div id="t" style="color:#cccccc;font-size:0.85rem;margin-top:4px;"></div>
+</div>
+<script>
+const ch = new BroadcastChannel('ou_progress');
+ch.onmessage = (e) => {
+  const d = e.data, w = document.getElementById('w');
+  if (d.done) { w.style.display = 'none'; return; }
+  w.style.display = 'block';
+  document.getElementById('f').style.width = (d.frac * 100).toFixed(1) + '%';
+  document.getElementById('t').textContent = d.text;
+};
+</script>
+"""
+
+
+def progress_widget():
+    """Client-side progress bar (rendered only in the browser build)."""
+    if IN_BROWSER:
+        import streamlit.components.v1 as components
+        components.html(_PROGRESS_WIDGET, height=50)
 
 
 def _overlay_elements(ax, cols):
@@ -639,51 +680,141 @@ with smp_preview:
 with tab_acq:
     if poly:
         st.caption("Polycrystal acquisition runs the full 3D anisotropic elastic "
-                   "solver (21-component stiffness per grain) in Python; roughly "
-                   "1-2 s per transmit at the default grid.")
+                   "solver (21-component stiffness per grain); on grids above "
+                   "~35 per axis it runs on the GPU automatically when CuPy is "
+                   "available (10-25x faster at 56-68 grid points).")
     else:
         st.caption("3D acquisition and inversion are heavier; expect this to take a little while.")
-    if st.button("Run acquisition", type="primary"):
-        acq_bar = st.progress(0.0, text="Simulating full-matrix capture ...")
+    # Incremental acquisition: ONE transmit per Streamlit rerun, so the
+    # progress bar repaints between steps (essential in the in-browser/stlite
+    # build, where a long synchronous computation blocks all UI updates).
+    _acq_sig = (n, nt, n_elem, tuple(src_list), poly, el_shape)
+    progress_widget()
+    if st.button("Run acquisition", type="primary",
+                 disabled="acq_job" in st.session_state):
+        st.session_state.acq_job = dict(
+            i=0, t0=time.time(), sig=_acq_sig,
+            data=np.zeros((len(src_list), nt, n_elem)))
+        st.rerun()
 
-        def _acq_progress(done, total, elapsed):
-            eta = elapsed / done * (total - done)
-            acq_bar.progress(done / total,
-                             text=f"Acquisition: transmit {done}/{total} "
-                                  f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
-
-        data = run_acquisition(phantom.velocity_to_m(c_true), progress=_acq_progress)
-        acq_bar.empty()
-        data = apply_rx_filter(data, axis=1)            # RX front end, every channel
-        elem_pos = ring.element_positions
-        st.session_state.ds = Dataset(
-            geometry=ArrayGeometry(elem_pos, ring.radius_m, f0, "cylinder"),
-            data=data, sample_rate_hz=1.0 / dt, tx_wavelet=wavelet_rec,
-            tx_centre_freq_hz=f0, nominal_speed_m_s=c_coup,
-            ground_truth={"c": c_true, "h_m": h})
-        st.session_state.src_list = src_list
-        st.session_state.wavelet_eff = wavelet_rec
-        # FPGA capture stage: always part of the pipeline, not an option.
-        if hw_cosim.available():
-            with st.spinner("FPGA capture stage: streaming through rx_capture.sv (Icarus Verilog) ..."):
-                n_frames = int(min(3, data.shape[0]))
-                cap_nt = int(min(data.shape[1], 384))
-                sub = data[:n_frames, :cap_nt, :].transpose(0, 2, 1)   # (frames, ch, samples)
-                scale = 30000.0 / (np.max(np.abs(sub)) + 1e-30)
-                q = np.round(sub * scale).astype(np.int64)
-                rx_sv = os.path.join(HERE, "..", "..", "hardware", "fpga", "rtl", "rx_capture.sv")
-                try:
-                    rtl = hw_cosim.run_rx_capture(q, rx_sv)
-                    st.session_state.hw = (rtl, bool(np.array_equal(rtl, q)), n_frames, cap_nt)
-                except Exception as e:
-                    st.session_state.hw = None
-                    st.error(f"FPGA capture stage failed: {e}")
+    job = st.session_state.get("acq_job")
+    if job is not None:
+        if job["sig"] != _acq_sig:
+            del st.session_state.acq_job
+            js_progress(done=True)
+            st.warning("Configuration changed during the acquisition; run aborted.")
         else:
-            st.session_state.hw = None
-            st.warning("Icarus Verilog (iverilog) not found: the FPGA capture stage "
-                       "of the pipeline was skipped.")
-        st.success(f"Acquired {data.shape[0]} transmits x {data.shape[1]} samples x {data.shape[2]} channels"
-                   + (" | RX band-pass applied" if rx_filt_on else ""))
+            i, total = job["i"], len(src_list)
+            m_now = phantom.velocity_to_m(c_true)
+            # Client-GPU path (browser build with WebGPU): the whole FMC runs
+            # on the visitor's GPU; we poll it across reruns. One transmit is
+            # then recomputed on the CPU as a live parity check.
+            can_wgpu = (not poly and footprints is None
+                        and not job.get("wgpu_failed")
+                        and webgpu_client.available())
+            if can_wgpu and job["i"] == 0:
+                if "wgpu_id" not in job:
+                    job["wgpu_id"] = webgpu_client.start(
+                        m_now, ring, wavelet, dt, h, nt, src_list)
+                    st.rerun()
+                stat = webgpu_client.poll(job["wgpu_id"])
+                if stat["error"]:
+                    st.warning(f"Client GPU failed ({stat['error']}); "
+                               "falling back to CPU.")
+                    job.pop("wgpu_id", None)
+                    job["wgpu_failed"] = True
+                    st.rerun()
+                elif not stat["done"]:
+                    st.progress(stat["prog"] / max(stat["total"], 1),
+                                text=f"Acquisition on YOUR GPU (WebGPU): transmit "
+                                     f"{stat['prog']}/{stat['total']} ...")
+                    st.rerun()
+                else:
+                    gpu_data = webgpu_client.result(job["wgpu_id"], total, nt,
+                                                    n_elem)
+                    ref = fwi.forward_fmc(m_now, ring, wavelet, dt, h, nt,
+                                          src_list=[src_list[0]])[0]
+                    rel = (np.max(np.abs(gpu_data[0] - ref))
+                           / (np.max(np.abs(ref)) + 1e-30))
+                    if rel < 1e-3:
+                        job["data"][:] = gpu_data
+                        job["i"] = total
+                        i = total
+                        st.caption(f"Client-GPU acquisition verified against the "
+                                   f"CPU reference: rel {rel:.1e}")
+                    else:
+                        st.warning(f"Client-GPU parity check failed "
+                                   f"(rel {rel:.1e}); falling back to CPU.")
+                        job.pop("wgpu_id", None)
+                        job["wgpu_failed"] = True
+                        st.rerun()
+            if job["i"] < total:
+                elapsed = time.time() - job["t0"]
+                eta = elapsed / max(i, 1) * (total - i)
+                msg = (f"Acquisition: transmit {i + 1}/{total}"
+                       + (f" ({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)"
+                          if i else " ..."))
+                js_progress(i / total, msg)         # paints even while Python runs
+                if not IN_BROWSER:
+                    st.progress(i / total, text=msg)
+            s = src_list[min(i, total - 1)]
+            if job["i"] >= total:
+                pass                                     # GPU filled everything
+            elif poly:
+                src_pts = (list(zip(footprints[s][0], footprints[s][1]))
+                           if footprints is not None else None)
+                rec, _ = elastic3d.forward(Cmaps3, rho_map3, h, dt, nt,
+                                           ring.element_index(s), wavelet, ring.idx,
+                                           source="explosive", record="pressure",
+                                           src_pts=src_pts, rec_groups=footprints,
+                                           device="auto")
+                job["data"][i] = rec
+            elif footprints is not None:
+                job["data"][i] = fwi.forward_fmc(m_now, ring, wavelet, dt, h, nt,
+                                                 src_list=[s],
+                                                 footprints=footprints)[0]
+            else:
+                fast = GPU_BACKEND if GPU_BACKEND is not None else BACKEND
+                job["data"][i] = fast.forward_fmc(m_now, ring, wavelet, dt, h, nt,
+                                                  src_list=[s])[0]
+            if job["i"] < total:
+                job["i"] += 1
+            if job["i"] < total:
+                st.rerun()
+            # Final transmit done: assemble the dataset and run the FPGA stage.
+            js_progress(done=True)
+            data = apply_rx_filter(job["data"], axis=1)   # RX front end
+            del st.session_state.acq_job
+            st.session_state.ds = Dataset(
+                geometry=ArrayGeometry(ring.element_positions, ring.radius_m, f0,
+                                       "cylinder"),
+                data=data, sample_rate_hz=1.0 / dt, tx_wavelet=wavelet_rec,
+                tx_centre_freq_hz=f0, nominal_speed_m_s=c_coup,
+                ground_truth={"c": c_true, "h_m": h})
+            st.session_state.src_list = src_list
+            st.session_state.wavelet_eff = wavelet_rec
+            # FPGA capture stage: always part of the pipeline, not an option.
+            if hw_cosim.available():
+                with st.spinner("FPGA capture stage: streaming through rx_capture.sv (Icarus Verilog) ..."):
+                    n_frames = int(min(3, data.shape[0]))
+                    cap_nt = int(min(data.shape[1], 384))
+                    sub = data[:n_frames, :cap_nt, :].transpose(0, 2, 1)
+                    scale = 30000.0 / (np.max(np.abs(sub)) + 1e-30)
+                    q = np.round(sub * scale).astype(np.int64)
+                    rx_sv = os.path.join(HERE, "..", "..", "hardware", "fpga", "rtl", "rx_capture.sv")
+                    try:
+                        rtl = hw_cosim.run_rx_capture(q, rx_sv)
+                        st.session_state.hw = (rtl, bool(np.array_equal(rtl, q)), n_frames, cap_nt)
+                    except Exception as e:
+                        st.session_state.hw = None
+                        st.error(f"FPGA capture stage failed: {e}")
+            else:
+                st.session_state.hw = None
+                st.warning("Icarus Verilog (iverilog) not found: the FPGA capture "
+                           "stage of the pipeline was skipped.")
+            st.success(f"Acquired {data.shape[0]} transmits x {data.shape[1]} samples "
+                       f"x {data.shape[2]} channels"
+                       + (" | RX band-pass applied" if rx_filt_on else ""))
 
     if "ds" in st.session_state:
         ds = st.session_state.ds
@@ -789,6 +920,25 @@ with tab_fwi:
                  "the purely kinematic observable that anisotropic wave speeds "
                  "perturb. The robust misfits run on the Python core (slower).")
         mtype = _MISFITS[misfit_choice]
+        opt_choice = st.selectbox(
+            "Optimiser",
+            ["Gradient descent (line search)",
+             "Gauss-Newton (Jacobian iterations)"],
+            help="Gauss-Newton solves (JtJ + mu I) dm = -g with conjugate "
+                 "gradients using the exact Born linearisation — the "
+                 "curvature-aware Jacobian iteration. Far fewer outer "
+                 "iterations, but each costs roughly n_cg gradient "
+                 "iterations. L2 misfit only.")
+        use_gn = opt_choice.startswith("Gauss")
+        if use_gn and mtype != "l2":
+            st.info("Gauss-Newton is defined for the L2 misfit; using L2 for "
+                    "this run.")
+            mtype = "l2"
+        if use_gn:
+            st.caption("Each Gauss-Newton iteration runs ~8 CG steps of "
+                       "Born+adjoint solves (Python core): expect roughly 10x "
+                       "the time of a gradient iteration, but far fewer "
+                       "iterations needed (4 is usually plenty).")
         if mtype == "gcn":
             st.caption("GCN widens the convergence basin against cycle skipping; "
                        "amplitude-insensitive per trace (C++ accelerated).")
@@ -805,39 +955,74 @@ with tab_fwi:
                        "this platform is built to study. GCN misfit and a smoothed "
                        "gradient are the defaults here: they suppress the source-imprint "
                        "artefacts the elastic/acoustic mismatch otherwise produces.")
-        if st.button("Run FWI", type="primary"):
-            ds = st.session_state.ds
-            coords = np.mgrid[0:n, 0:n, 0:n].astype(float) * h
-            cc = (n - 1) * h / 2
-            r = np.sqrt((coords[1] - cc) ** 2 + (coords[2] - cc) ** 2)
-            mask = (r <= spec_r_m * (0.85 if poly else 0.95)).astype(float)
-            if poly:
-                hi_v = max(float(c_true.max()), c_coup) * 1.06
-                lo_v = min(float(c_true[c_true > 0].min()), c_coup) * 0.9
-                m_bounds = (phantom.velocity_to_m(hi_v), phantom.velocity_to_m(lo_v))
+        # Incremental FWI: ONE iteration per Streamlit rerun so the progress
+        # bar repaints between iterations (required in the in-browser build).
+        _fwi_sig = (n, nt, mtype, use_gn, n_iter, poly)
+        progress_widget()
+        if st.button("Run FWI", type="primary",
+                     disabled="fwi_job" in st.session_state):
+            st.session_state.fwi_job = dict(
+                m=phantom.velocity_to_m(c_bg), it=0, hist=[], t0=time.time(),
+                sig=_fwi_sig)
+            st.rerun()
+
+        fjob = st.session_state.get("fwi_job")
+        if fjob is not None:
+            if fjob["sig"] != _fwi_sig:
+                del st.session_state.fwi_job
+                js_progress(done=True)
+                st.warning("Configuration changed during FWI; run aborted.")
             else:
-                m_bounds = (phantom.velocity_to_m(c_spec + 700), phantom.velocity_to_m(min(flaw_c, c_spec) - 500))
-            wav_rec = st.session_state.get("wavelet_eff", wavelet_rec)
-            fwi_bar = st.progress(0.0, text=f"FWI: starting ({n_iter} iterations, {mtype.upper()}) ...")
-            t0_fwi = time.time()
+                ds = st.session_state.ds
+                coords = np.mgrid[0:n, 0:n, 0:n].astype(float) * h
+                cc = (n - 1) * h / 2
+                r = np.sqrt((coords[1] - cc) ** 2 + (coords[2] - cc) ** 2)
+                mask = (r <= spec_r_m * (0.85 if poly else 0.95)).astype(float)
+                if poly:
+                    hi_v = max(float(c_true.max()), c_coup) * 1.06
+                    lo_v = min(float(c_true[c_true > 0].min()), c_coup) * 0.9
+                    m_bounds = (phantom.velocity_to_m(hi_v), phantom.velocity_to_m(lo_v))
+                else:
+                    m_bounds = (phantom.velocity_to_m(c_spec + 700),
+                                phantom.velocity_to_m(min(flaw_c, c_spec) - 500))
+                wav_rec = st.session_state.get("wavelet_eff", wavelet_rec)
+                # Backend choice per run: GPU for L2 point-element inversions,
+                # C++ for L2/GCN, Python otherwise (robust misfits, apertures,
+                # Gauss-Newton runs its own Python path).
+                if GPU_BACKEND is not None and mtype == "l2" and footprints is None:
+                    backend = GPU_BACKEND
+                elif BACKEND is not fwi and footprints is None:
+                    backend = BACKEND
+                else:
+                    backend = None
 
-            def _fwi_progress(done, total):
-                elapsed = time.time() - t0_fwi
-                eta = elapsed / done * (total - done)
-                fwi_bar.progress(done / total,
-                                 text=f"FWI: iteration {done}/{total} "
-                                      f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
-
-            use_cpp = BACKEND is not fwi and footprints is None
-            backend = BACKEND if use_cpp else None
-            m_rec, hist = fwi.invert(
-                phantom.velocity_to_m(c_bg), ring, wav_rec, dt, h, nt, ds.data,
-                src_list=st.session_state.get("src_list"), n_iter=n_iter, step_frac=0.03,
-                update_mask=mask, m_bounds=m_bounds, backend=backend, misfit_type=mtype,
-                footprints=footprints, progress=_fwi_progress,
-                smooth_sigma=2.0 if poly else 1.0)
-            fwi_bar.empty()
-            st.session_state.rec = (phantom.m_to_velocity(m_rec), hist)
+                it = fjob["it"]
+                elapsed = time.time() - fjob["t0"]
+                eta = elapsed / max(it, 1) * (n_iter - it)
+                msg = (f"FWI: iteration {it + 1}/{n_iter} ({mtype.upper()})"
+                       + (f" ({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)"
+                          if it else " ..."))
+                js_progress(it / n_iter, msg)       # paints even while Python runs
+                if not IN_BROWSER:
+                    st.progress(it / n_iter, text=msg)
+                m_new, hseg = fwi.invert(
+                    fjob["m"], ring, wav_rec, dt, h, nt, ds.data,
+                    src_list=st.session_state.get("src_list"), n_iter=1,
+                    step_frac=0.03, update_mask=mask, m_bounds=m_bounds,
+                    backend=backend, misfit_type=mtype, footprints=footprints,
+                    smooth_sigma=2.0 if poly else 1.0,
+                    optimizer="gauss-newton" if use_gn else "gd")
+                fjob["hist"].append(hseg[0])
+                stalled = len(hseg) >= 2 and hseg[-1] >= hseg[0] * (1 - 1e-12)
+                fjob["m"] = m_new
+                fjob["it"] += 1
+                if fjob["it"] < n_iter and not stalled:
+                    st.rerun()
+                fjob["hist"].append(hseg[-1])
+                js_progress(done=True)
+                st.session_state.rec = (phantom.m_to_velocity(fjob["m"]),
+                                        fjob["hist"])
+                del st.session_state.fwi_job
         if "rec" in st.session_state:
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
