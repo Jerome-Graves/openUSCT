@@ -88,7 +88,11 @@ except Exception:
 _icon = os.path.join(HERE, "..", "..", "docs", "logo-192.png")
 st.set_page_config(page_title="OpenUSCT Studio", layout="wide",
                    page_icon=_icon if os.path.exists(_icon) else "🌊")
-st.title("OpenUSCT Studio")
+st.markdown(
+    '<div style="display:flex;align-items:center;gap:0.8rem;padding:0.2rem 0 0.6rem 0;">'
+    '<svg width="52" height="52" viewBox="0 0 512 512" style="flex:0 0 auto;" xmlns="http://www.w3.org/2000/svg"><g transform="translate(256,256)"><circle r="226" fill="none" stroke="#2f7fb8" stroke-width="30"/><path d="M 0 -168 C 20 -58 58 -20 168 0 C 58 20 20 58 0 168 C -20 58 -58 20 -168 0 C -58 -20 -20 -58 0 -168 Z" fill="#54a8d6" stroke="#1b4f72" stroke-width="10" stroke-linejoin="round"/><circle r="30" fill="#eaf4fa"/></g></svg>'
+    '<span style="font-size:2.4rem;font-weight:700;">OpenUSCT Studio</span>'
+    "</div>", unsafe_allow_html=True)
 st.caption(f"3D cylindrical-array ultrasound acquisition and reconstruction, pure Python. Backend: {BACKEND_NAME}.")
 
 tab_arr, tab_exc, tab_smp, tab_acq, tab_img, tab_fwi = st.tabs(
