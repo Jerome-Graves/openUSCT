@@ -56,12 +56,16 @@ def fmc(labels, axes, ring, h, dt, nt, wavelet, src_list, material=None,
 
 
 def make_residual(labels, ring, h, dt, nt, wavelet, src_list, dobs,
-                  material=None):
+                  material=None, filter_fn=None, device="auto"):
     """Per-trace-normalised residual vector r(params) and its half-SSQ misfit.
 
     Each source-receiver trace is normalised by the observed trace energy and
     the transmitter's own trace is excluded (its near-source blast carries no
     orientation information and would otherwise dominate).
+
+    ``filter_fn`` is applied to the synthetic data before differencing (pass
+    the same RX front-end filter the observed data went through; the chain is
+    linear so filtering both sides is consistent).
 
     Returns ``residual(params) -> r`` with J(params) = 0.5 * r.r matching the
     misfit used by the search-based COF inversion.
@@ -73,7 +77,9 @@ def make_residual(labels, ring, h, dt, nt, wavelet, src_list, dobs,
 
     def residual(params):
         d = fmc(labels, axes_from_params(params), ring, h, dt, nt, wavelet,
-                src_list, material=material)
+                src_list, material=material, device=device)
+        if filter_fn is not None:
+            d = filter_fn(d)
         r = (d - dobs) * (w / tr_norm)[:, None, :]
         return r.ravel()
 
