@@ -37,8 +37,10 @@ static Arr forward_fmc(Arr m, double h, double dt, int nt,
 }
 
 // misfit_and_gradient(...) -> (J, grad[shape of m])
+// misfit_type: 0 = least squares, 1 = global correlation norm (GCN).
 static py::tuple misfit_and_gradient(Arr m, double h, double dt, int nt,
-                                     IArr tx_lin, IArr rec_lin, Arr wavelet, Arr dobs) {
+                                     IArr tx_lin, IArr rec_lin, Arr wavelet, Arr dobs,
+                                     int misfit_type) {
     auto dims = shape_of(m);
     int ndim = static_cast<int>(dims.size());
     int n_tx = static_cast<int>(tx_lin.size());
@@ -47,7 +49,8 @@ static py::tuple misfit_and_gradient(Arr m, double h, double dt, int nt,
     Arr grad(dims);
     double J = uap::misfit_and_gradient(m.data(), dims.data(), ndim, h, dt, nt,
                                         tx_lin.data(), n_tx, rec_lin.data(), n_rec,
-                                        wavelet.data(), dobs.data(), grad.mutable_data());
+                                        wavelet.data(), dobs.data(), grad.mutable_data(),
+                                        misfit_type);
     return py::make_tuple(J, grad);
 }
 
@@ -58,5 +61,6 @@ PYBIND11_MODULE(_uap, mod) {
             py::arg("tx_lin"), py::arg("rec_lin"), py::arg("wavelet"));
     mod.def("misfit_and_gradient", &misfit_and_gradient,
             py::arg("m"), py::arg("h"), py::arg("dt"), py::arg("nt"),
-            py::arg("tx_lin"), py::arg("rec_lin"), py::arg("wavelet"), py::arg("dobs"));
+            py::arg("tx_lin"), py::arg("rec_lin"), py::arg("wavelet"), py::arg("dobs"),
+            py::arg("misfit_type") = 0);
 }

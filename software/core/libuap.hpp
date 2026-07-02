@@ -11,6 +11,7 @@
 // positions. This keeps the core free of any tuple or geometry handling.
 
 #pragma once
+#include <cmath>
 #include <vector>
 #include <cstddef>
 
@@ -114,13 +115,62 @@ inline void forward_fmc(const double* m, const int* dims, int ndim, double h, do
     }
 }
 
-// Least-squares waveform misfit and its exact discrete-adjoint gradient in the
-// squared-slowness field. dobs layout matches forward_fmc; grad has N cells.
+// Misfit value and adjoint source for one transmit's data (nt x n_rec,
+// time-major). misfit_type 0 = least squares (adjoint source = residual);
+// misfit_type 1 = global correlation norm (per-trace normalised
+// cross-correlation, J = sum_j (1 - c_j)), matching ringfwi.fwi.
+inline double adjoint_residual(const double* dsyn, const double* dobs,
+                               int nt, int n_rec, int misfit_type, double* res) {
+    const std::size_t total = static_cast<std::size_t>(nt) * n_rec;
+    if (misfit_type == 0) {
+        double J = 0.0;
+        for (std::size_t k = 0; k < total; ++k) {
+            res[k] = dsyn[k] - dobs[k];
+            J += 0.5 * res[k] * res[k];
+        }
+        return J;
+    }
+    // GCN: per-trace (per receiver column) norms and correlation.
+    const double eps = 1e-12;
+    std::vector<double> ns(n_rec, 0.0), no(n_rec, 0.0), c(n_rec, 0.0);
+    for (int k = 0; k < nt; ++k) {
+        const double* srow = dsyn + static_cast<std::size_t>(k) * n_rec;
+        const double* orow = dobs + static_cast<std::size_t>(k) * n_rec;
+        for (int j = 0; j < n_rec; ++j) {
+            ns[j] += srow[j] * srow[j];
+            no[j] += orow[j] * orow[j];
+        }
+    }
+    for (int j = 0; j < n_rec; ++j) {
+        ns[j] = std::sqrt(ns[j]) + eps;
+        no[j] = std::sqrt(no[j]) + eps;
+    }
+    for (int k = 0; k < nt; ++k) {
+        const double* srow = dsyn + static_cast<std::size_t>(k) * n_rec;
+        const double* orow = dobs + static_cast<std::size_t>(k) * n_rec;
+        for (int j = 0; j < n_rec; ++j) c[j] += (srow[j] / ns[j]) * (orow[j] / no[j]);
+    }
+    double J = 0.0;
+    for (int j = 0; j < n_rec; ++j) J += 1.0 - c[j];
+    for (int k = 0; k < nt; ++k) {
+        const double* srow = dsyn + static_cast<std::size_t>(k) * n_rec;
+        const double* orow = dobs + static_cast<std::size_t>(k) * n_rec;
+        double* rrow = res + static_cast<std::size_t>(k) * n_rec;
+        for (int j = 0; j < n_rec; ++j)
+            rrow[j] = -(orow[j] / no[j] - c[j] * (srow[j] / ns[j])) / ns[j];
+    }
+    return J;
+}
+
+// Waveform misfit and its exact discrete-adjoint gradient in the squared-
+// slowness field. dobs layout matches forward_fmc; grad has N cells.
+// misfit_type: 0 = least squares, 1 = global correlation norm.
 // Returns the misfit J.
 inline double misfit_and_gradient(const double* m, const int* dims, int ndim,
                                   double h, double dt, int nt,
                                   const int* tx_lin, int n_tx, const int* rec_lin, int n_rec,
-                                  const double* wavelet, const double* dobs, double* grad) {
+                                  const double* wavelet, const double* dobs, double* grad,
+                                  int misfit_type = 0) {
     const std::size_t N = cell_count(dims, ndim);
     const long long Nll = static_cast<long long>(N);
     const double inv_h2 = 1.0 / (h * h);
@@ -141,10 +191,7 @@ inline double misfit_and_gradient(const double* m, const int* dims, int ndim,
         forward(m, dims, ndim, h, dt, nt, tx_lin[t], wavelet, rec_lin, n_rec, dsyn.data(), U.data());
 
         const double* dob = dobs + static_cast<std::size_t>(t) * nt * n_rec;
-        for (std::size_t k = 0; k < static_cast<std::size_t>(nt) * n_rec; ++k) {
-            res[k] = dsyn[k] - dob[k];
-            J += 0.5 * res[k] * res[k];
-        }
+        J += adjoint_residual(dsyn.data(), dob, nt, n_rec, misfit_type, res.data());
 
         for (std::size_t i = 0; i < N; ++i) { lam_p1[i] = 0.0; lam_p2[i] = 0.0; }
 

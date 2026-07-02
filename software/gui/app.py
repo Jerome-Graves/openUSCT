@@ -515,11 +515,13 @@ function applyCut(fr) {
 }
 // Slicing arms only once the cursor actually touches the rendered geometry.
 gd.on('plotly_hover', () => { armed = true; });
+const CUT_LIFT = 0.10;  // keep the cut a little ABOVE the cursor, so the cut
+                        // face stays under the pointer and grain hover works
 gd.addEventListener('mousemove', ev => {
   if (!armed) return;                          // not over the geometry yet
   if (ev.buttons !== 0) return;               // don't slice while rotating
   const r = gd.getBoundingClientRect();
-  frac = Math.min(1.0, Math.max(0.03, 1 - (ev.clientY - r.top) / r.height));
+  frac = Math.min(1.0, Math.max(0.03, 1 - (ev.clientY - r.top) / r.height + CUT_LIFT));
   if (!pending) { pending = true; requestAnimationFrame(() => { applyCut(frac); pending = false; }); }
 });
 gd.addEventListener('mouseleave', () => { armed = false; applyCut(1.0); });
@@ -766,14 +768,33 @@ with tab_fwi:
         st.info("Run an acquisition first.")
     else:
         n_iter = st.slider("FWI iterations", 4, 16, 8 if poly else 6)
+        _MISFITS = {
+            "L2 (least squares)": "l2",
+            "GCN (normalised cross-correlation)": "gcn",
+            "Envelope (phase-insensitive, unmodelled-physics robust)": "envelope",
+            "Envelope-GCN (scale- and phase-insensitive)": "egcn",
+            "Traveltime (cross-correlation lags, kinematic)": "traveltime",
+            "Graph-space OT (optimal transport, cycle-skip robust)": "gsot",
+        }
         misfit_choice = st.selectbox(
-            "Misfit functional",
-            ["L2 (least squares)", "GCN (normalised cross-correlation, robust)"],
-            index=1 if poly else 0)
-        mtype = "gcn" if misfit_choice.startswith("GCN") else "l2"
+            "Misfit functional", list(_MISFITS),
+            index=1 if poly else 0,
+            help="L2/GCN compare waveforms (C++ accelerated). Envelope and "
+                 "Envelope-GCN compare Hilbert envelopes — robust when the "
+                 "operator cannot model the waveform physics (anisotropy, "
+                 "elasticity). Traveltime penalises per-trace arrival lags — "
+                 "the purely kinematic observable that anisotropic wave speeds "
+                 "perturb. The robust misfits run on the Python core (slower).")
+        mtype = _MISFITS[misfit_choice]
         if mtype == "gcn":
-            st.caption("GCN widens the convergence basin against cycle skipping; it runs on "
-                       "the Python core (no C++ acceleration), so it is slower.")
+            st.caption("GCN widens the convergence basin against cycle skipping; "
+                       "amplitude-insensitive per trace (C++ accelerated).")
+        elif mtype in ("envelope", "egcn", "traveltime", "gsot"):
+            st.caption("Robust misfit: adjoint source verified by finite-difference "
+                       "gradient check; runs on the Python core, so iterations are "
+                       "slower than L2/GCN."
+                       + (" GSOT additionally solves an optimal assignment per trace "
+                          "(heaviest, most convex)." if mtype == "gsot" else ""))
         if poly:
             st.caption("The data are full 3D anisotropic elastic; acoustic FWI "
                        "reconstructs an APPARENT velocity field (compare against the "
@@ -804,7 +825,7 @@ with tab_fwi:
                                  text=f"FWI: iteration {done}/{total} "
                                       f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
 
-            use_cpp = BACKEND is not fwi and mtype == "l2" and footprints is None
+            use_cpp = BACKEND is not fwi and footprints is None
             backend = BACKEND if use_cpp else None
             m_rec, hist = fwi.invert(
                 phantom.velocity_to_m(c_bg), ring, wav_rec, dt, h, nt, ds.data,

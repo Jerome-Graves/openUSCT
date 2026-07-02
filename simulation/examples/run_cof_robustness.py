@@ -40,8 +40,9 @@ RADIUS = 0.010
 DOM = 2 * RADIUS + 0.008
 T_WIN = 22e-6
 F0 = 0.3e6
-N_INV = 24            # inversion grid
-N_TRUE = 32           # fine grid for inverse-crime-free observed data
+N_INV = 30            # inversion grid
+N_TRUE = 36           # fine grid for inverse-crime-free observed data
+N_SWEEPS = 2          # coarse Gauss-Seidel sweeps (one is order-sensitive)
 
 
 def make_setup(n_grid):
@@ -113,9 +114,20 @@ def axis_error_deg(a, b):
     return np.degrees(np.arccos(np.clip(abs(float(np.dot(a, b))), 0.0, 1.0)))
 
 
-def invert(S, dobs, src_list, tag):
-    """Per-grain Gauss-Seidel + refinement; returns recovered axes."""
-    tr_norm = np.sum(dobs ** 2, axis=1) + 1e-30
+def invert(S, dobs, src_list, tag, objective="waveform"):
+    """Per-grain Gauss-Seidel + refinement; returns recovered axes.
+
+    ``objective``: "waveform" = per-trace normalised L2 on the waveforms;
+    "envelope" = the same on Hilbert envelopes (phase-insensitive, tolerant of
+    the numerical-dispersion mismatch between different discretisations).
+    """
+    from scipy.signal import hilbert
+
+    def _obs(d):
+        return np.abs(hilbert(d, axis=1)) if objective == "envelope" else d
+
+    dref = _obs(dobs)
+    tr_norm = np.sum(dref ** 2, axis=1) + 1e-30
     w = np.ones_like(tr_norm)
     for i, s in enumerate(src_list):
         w[i, s] = 0.0
@@ -124,21 +136,22 @@ def invert(S, dobs, src_list, tag):
 
     def J(axes):
         n_eval[0] += 1
-        d = fmc(S, axes, src_list)
-        return float(np.sum(w * np.sum((d - dobs) ** 2, axis=1) / tr_norm))
+        d = _obs(fmc(S, axes, src_list))
+        return float(np.sum(w * np.sum((d - dref) ** 2, axis=1) / tr_norm))
 
     axes = np.tile([0.0, 0.0, 1.0], (N_GRAINS, 1))
     j_cur = J(axes)
     coarse = [_hemi(d) for d in _fibonacci_directions(16, hemisphere=True)]
-    for g in range(N_GRAINS):
-        best_j, best_a = j_cur, axes[g].copy()
-        for d in coarse:
-            axes[g] = d
-            jt = J(axes)
-            if jt < best_j:
-                best_j, best_a = jt, np.array(d)
-        axes[g] = best_a
-        j_cur = best_j
+    for _sweep in range(N_SWEEPS):
+        for g in range(N_GRAINS):
+            best_j, best_a = j_cur, axes[g].copy()
+            for d in coarse:
+                axes[g] = d
+                jt = J(axes)
+                if jt < best_j:
+                    best_j, best_a = jt, np.array(d)
+            axes[g] = best_a
+            j_cur = best_j
     for deg in (15.0, 7.0, 3.0):
         for g in range(N_GRAINS):
             improved = True
@@ -175,13 +188,14 @@ def main():
     rng = np.random.default_rng(99)
     results = {}
     results["clean (control)"] = invert(S, d_same, src4, "clean")
-    for snr in (30, 20, 10):
-        results[f"SNR {snr} dB"] = invert(S, add_noise(d_same, snr, rng), src4,
-                                          f"snr{snr}")
+    results["SNR 10 dB"] = invert(S, add_noise(d_same, 10, rng), src4, "snr10")
     results["2 transmits, clean"] = invert(S, d_same[:2], src2, "2tx")
-    results["fine-grid truth"] = invert(S, d_fine, src4, "finegrid")
-    results["fine-grid + 20 dB"] = invert(S, add_noise(d_fine, 20, rng), src4,
-                                          "fine+20dB")
+    results["fine-grid (waveform)"] = invert(S, d_fine, src4, "fine-wf")
+    results["fine-grid (envelope)"] = invert(S, d_fine, src4, "fine-env",
+                                             objective="envelope")
+    results["fine + 20 dB (envelope)"] = invert(S, add_noise(d_fine, 20, rng),
+                                                src4, "fine+20dB-env",
+                                                objective="envelope")
 
     print("\n=== COF robustness study (mean / max axis error, deg) ===")
     for k, (m, x) in results.items():
