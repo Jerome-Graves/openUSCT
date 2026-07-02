@@ -68,9 +68,18 @@ def _move(f, src, dst):
     return f
 
 
+def gpu_available():
+    """True when CuPy and a CUDA device are usable."""
+    try:
+        import cupy as cp
+        return cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
+
+
 def forward(C, rho, h, dt, nt, src_idx, wavelet, rec_idx,
             source="explosive", record="pressure", store=False,
-            src_pts=None, rec_groups=None):
+            src_pts=None, rec_groups=None, device="cpu"):
     """Full 3D anisotropic elastic forward model.
 
     C : dict with the 21 upper-triangle Voigt stiffnesses, keys "C11".."C66"
@@ -82,23 +91,68 @@ def forward(C, rho, h, dt, nt, src_idx, wavelet, rec_idx,
     Finite-aperture elements: ``src_pts`` (list of (idx, weight)) spreads the
     transmit over an element footprint; ``rec_groups`` (list over receivers of
     (idx_list, weights)) records the weighted-average field over each footprint.
+
+    device : "cpu" (float64 NumPy, the verified reference), "gpu" (float32
+    CuPy) or "auto" (GPU when available). The wavefield history (``store``)
+    stays on the CPU path.
     """
-    rho = np.asarray(rho, float)
-    nz, ny, nx = rho.shape
+    use_gpu = False
+    if device in ("auto", "gpu") and not store:
+        big_enough = device == "gpu" or np.asarray(rho).size >= 40000
+        if gpu_available() and big_enough:
+            use_gpu = True                  # below ~40k cells launch overhead
+        elif device == "gpu":               # loses to the CPU, so "auto" stays
+            raise RuntimeError("device='gpu' requested but CuPy/CUDA unavailable")
+    if use_gpu:
+        import cupy as xp
+        dtype = xp.float32
+    else:
+        xp = np
+        dtype = np.float64
+
+    rho_h = np.asarray(rho, float)
+    nz, ny, nx = rho_h.shape
     inv_h = 1.0 / h
 
-    def cij(i, j):
+    # Activity decided on the host arrays (avoids device syncs per pair).
+    def cij_host(i, j):
         return C[f"C{min(i, j)}{max(i, j)}"]
 
-    active = {(I, J): bool(np.any(cij(I, J))) for I in range(1, 7)
+    active = {(I, J): bool(np.any(cij_host(I, J))) for I in range(1, 7)
               for J in range(1, 7)}
+    Cd = {k: (xp.asarray(v, dtype) if np.ndim(v) else float(v))
+          for k, v in C.items()}
+
+    def cij(i, j):
+        return Cd[f"C{min(i, j)}{max(i, j)}"]
+
+    rho = xp.asarray(rho_h, dtype)
     if src_pts is None:
         src_pts = [(src_idx, 1.0)]
 
-    vx = np.zeros((nz, ny, nx)); vy = np.zeros((nz, ny, nx)); vz = np.zeros((nz, ny, nx))
-    s = {I: np.zeros((nz, ny, nx)) for I in range(1, 7)}
-    n_rx = len(rec_groups) if rec_groups is not None else len(rec_idx)
-    rec = np.zeros((nt, n_rx))
+    def _lin(t):
+        return (t[0] * ny + t[1]) * nx + t[2]
+
+    # Vectorised receiver sampling (per-element reads would sync the GPU).
+    if rec_groups is not None:
+        kmax = max(len(idxs) for idxs, _ in rec_groups)
+        idx_mat = np.zeros((len(rec_groups), kmax), dtype=np.int64)
+        w_mat = np.zeros((len(rec_groups), kmax))
+        for j, (idxs, ws) in enumerate(rec_groups):
+            for k_, (ix, wi) in enumerate(zip(idxs, ws)):
+                idx_mat[j, k_] = _lin(ix)
+                w_mat[j, k_] = wi
+        idx_mat = xp.asarray(idx_mat)
+        w_mat = xp.asarray(w_mat, dtype)
+        n_rx = len(rec_groups)
+    else:
+        rec_lin = xp.asarray(np.array([_lin(t) for t in rec_idx], dtype=np.int64))
+        n_rx = len(rec_idx)
+
+    vx = xp.zeros((nz, ny, nx), dtype); vy = xp.zeros((nz, ny, nx), dtype)
+    vz = xp.zeros((nz, ny, nx), dtype)
+    s = {I: xp.zeros((nz, ny, nx), dtype) for I in range(1, 7)}
+    rec = xp.zeros((nt, n_rx), dtype)
     hist = None if not store else np.zeros((nt, nz, ny, nx))
     Z, Y, X = _AX["z"], _AX["y"], _AX["x"]
 
@@ -151,13 +205,15 @@ def forward(C, rho, h, dt, nt, src_idx, wavelet, rec_idx,
             field = -(s[1] + s[2] + s[3]) / 3.0
         else:
             field = {"vx": vx, "vy": vy, "vz": vz}[record]
+        flat = field.ravel()
         if rec_groups is not None:
-            for j, (idxs, ws) in enumerate(rec_groups):
-                rec[n, j] = sum(w * field[ix] for ix, w in zip(idxs, ws))
+            rec[n] = (flat[idx_mat] * w_mat).sum(axis=1)
         else:
-            for j, idx in enumerate(rec_idx):
-                rec[n, j] = field[idx]
+            rec[n] = flat[rec_lin]
         if hist is not None:
             hist[n] = np.sqrt(vx * vx + vy * vy + vz * vz)
 
+    if use_gpu:
+        import cupy as cp
+        rec = cp.asnumpy(rec).astype(np.float64)
     return rec, hist
