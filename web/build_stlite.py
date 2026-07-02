@@ -17,6 +17,7 @@ import os
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FILES = {
+    ".streamlit/config.toml": ".streamlit/config.toml",
     "software/gui/app.py": "software/gui/app.py",
     "software/gui/hw_cosim.py": "software/gui/hw_cosim.py",
     "software/gui/webgpu_client.py": "software/gui/webgpu_client.py",
@@ -39,7 +40,9 @@ TEMPLATE = """<!doctype html>
   <link rel="stylesheet"
         href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.86.0/build/stlite.css" />
   <style>
-    #loading { font-family: sans-serif; padding: 2rem; color: #444; }
+    body { background: #0a1017; }
+    #loading { font-family: sans-serif; padding: 2rem; color: #9fb8cc; }
+    #loading h2 { color: #7fcbe8; }
   </style>
 </head>
 <body>

@@ -29,6 +29,12 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.rcParams.update({
+    "text.color": "#dbe9f4", "axes.labelcolor": "#dbe9f4",
+    "axes.edgecolor": "#5b7a94", "xtick.color": "#a9c4da",
+    "ytick.color": "#a9c4da", "figure.facecolor": (0, 0, 0, 0),
+    "axes.facecolor": (0, 0, 0, 0), "savefig.transparent": True,
+})
 import streamlit as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -368,8 +374,8 @@ def js_progress(frac=0.0, text="", done=False):
 
 _PROGRESS_WIDGET = """
 <div id="w" style="display:none;font-family:sans-serif;padding-top:6px;">
-  <div style="background:#31333f;border-radius:4px;height:10px;width:100%;">
-    <div id="f" style="background:#ff4b4b;height:10px;border-radius:4px;width:0%;
+  <div style="background:#16283a;border-radius:4px;height:10px;width:100%;">
+    <div id="f" style="background:#54a8d6;height:10px;border-radius:4px;width:0%;
                        transition:width 0.2s;"></div>
   </div>
   <div id="t" style="color:#cccccc;font-size:0.85rem;margin-top:4px;"></div>
