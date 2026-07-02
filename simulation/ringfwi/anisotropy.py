@@ -65,6 +65,113 @@ def rotate_voigt(C, theta):
     return tensor_to_voigt(Tr)
 
 
+def theta_stiffness_maps(theta_map, base3):
+    """Per-voxel rotated stiffness maps and their exact theta-derivatives.
+
+    ``theta_map`` is a per-voxel in-plane c-axis angle field; ``base3`` the
+    unrotated 3x3 in-plane Voigt stiffness (for example
+    :func:`ice_stiffness_2d` at theta=0). Returns two dicts of (ny, nx) maps,
+    ``C`` and ``dC/dtheta``, with keys C11, C12, C22, C66, C16, C26. The
+    derivative is analytic (rotation generator), so the chained orientation
+    gradient stays exact.
+    """
+    T = voigt_to_tensor(np.asarray(base3, float))
+    shape = np.asarray(theta_map).shape
+    th = np.asarray(theta_map, float).ravel()
+    c, s = np.cos(th), np.sin(th)
+    R = np.stack([np.stack([c, -s], -1), np.stack([s, c], -1)], -2)   # (P,2,2)
+    dR = np.stack([np.stack([-s, -c], -1), np.stack([c, -s], -1)], -2)
+
+    def rot(Ra, Rb, Rc, Rd):
+        return np.einsum("pai,pbj,pck,pdl,ijkl->pabcd", Ra, Rb, Rc, Rd, T)
+
+    Cv = rot(R, R, R, R)
+    dCv = (rot(dR, R, R, R) + rot(R, dR, R, R)
+           + rot(R, R, dR, R) + rot(R, R, R, dR))
+    keys = {"C11": (0, 0), "C12": (0, 1), "C22": (1, 1),
+            "C66": (2, 2), "C16": (0, 2), "C26": (1, 2)}
+
+    def pick(Tv, a, b):
+        i, j = _VOIGT[a]
+        k, l = _VOIGT[b]
+        return np.ascontiguousarray(Tv[:, i, j, k, l]).reshape(shape)
+
+    C = {key: pick(Cv, a, b) for key, (a, b) in keys.items()}
+    dC = {key: pick(dCv, a, b) for key, (a, b) in keys.items()}
+    return C, dC
+
+
+def theta_misfit_and_gradient(theta_map, base3, rho, h, dt, nt, sources,
+                              wavelet, rec_idx, dobs_list):
+    """Misfit and its gradient w.r.t. the per-voxel ORIENTATION field.
+
+    This is the physically meaningful parameterisation for a known TI
+    material: each voxel carries the full direction-dependent velocity
+    function, encoded by one angle. Chain rule through the tensor rotation:
+    g_theta = sum_ij g_Cij * dCij/dtheta, with every factor exact.
+    """
+    C, dC = theta_stiffness_maps(theta_map, base3)
+    J = 0.0
+    g_theta = np.zeros_like(np.asarray(theta_map, float))
+    for src, dobs in zip(sources, dobs_list):
+        Ji, g = misfit_and_gradient(C["C11"], C["C12"], C["C22"], C["C66"],
+                                    rho, h, dt, nt, src, wavelet, rec_idx,
+                                    dobs, C["C16"], C["C26"])
+        J += Ji
+        for k in g:
+            g_theta += g[k] * dC[k]
+    return J, g_theta
+
+
+def invert_theta(theta0, base3, rho, h, dt, nt, sources, wavelet, rec_idx,
+                 dobs_list, n_iter=15, step_rad=0.15, smooth_sigma=1.5,
+                 update_mask=None, n_linesearch=5, verbose=False,
+                 progress=None):
+    """Voxel-wise orientation-field FWI (steepest descent with line search).
+
+    Inverts the in-plane c-axis angle map of a known TI material directly:
+    no grain geometry prior, no scalar-velocity approximation. The angle is
+    defined modulo pi (TI symmetry).
+    """
+    from scipy.ndimage import gaussian_filter
+
+    theta = np.asarray(theta0, float).copy()
+    mask = update_mask if update_mask is not None else 1.0
+    history = []
+    J, g = theta_misfit_and_gradient(theta, base3, rho, h, dt, nt, sources,
+                                     wavelet, rec_idx, dobs_list)
+    for it in range(n_iter):
+        history.append(J)
+        if verbose:
+            print(f"  theta-FWI iter {it:2d}  misfit = {J:.6e}", flush=True)
+        gm = g * mask
+        if smooth_sigma:
+            gm = gaussian_filter(gm, smooth_sigma) * mask
+        gmax = float(np.max(np.abs(gm)))
+        if gmax == 0.0:
+            break
+        step = step_rad
+        accepted = False
+        for _ in range(n_linesearch):
+            th_try = theta - step * gm / gmax
+            J_try, g_try = theta_misfit_and_gradient(th_try, base3, rho, h,
+                                                     dt, nt, sources, wavelet,
+                                                     rec_idx, dobs_list)
+            if J_try < J:
+                theta, J, g = th_try, J_try, g_try
+                accepted = True
+                break
+            step *= 0.5
+        if not accepted:
+            if verbose:
+                print("  line search failed; stopping")
+            break
+        if progress is not None:
+            progress(it + 1, n_iter)
+    history.append(J)
+    return theta, history
+
+
 def ice_stiffness_2d(theta=0.0):
     """In-plane Voigt stiffness for ice Ih in the plane containing the c-axis.
 
@@ -481,10 +588,38 @@ def _DfyT(g, inv_h):
     gf = np.zeros_like(g); gf[1:, :] += g[:-1, :] * inv_h; gf[:-1, :] -= g[:-1, :] * inv_h; return gf
 
 
-def _grad_forward(C11, C12, C22, C66, rho, h, dt, nt, src_idx, wavelet, rec_idx):
-    """Diagonal-stiffness forward that stores the velocity history for the adjoint."""
+def _c2k_T(g):
+    """Exact transpose of :func:`_centre_to_corner`."""
+    out = np.zeros_like(g)
+    q = 0.25 * g[:-1, :-1]
+    out[:-1, :-1] += q
+    out[1:, :-1] += q
+    out[:-1, 1:] += q
+    out[1:, 1:] += q
+    return out
+
+
+def _k2c_T(g):
+    """Exact transpose of :func:`_corner_to_centre`."""
+    out = np.zeros_like(g)
+    q = 0.25 * g[1:, 1:]
+    out[1:, 1:] += q
+    out[:-1, 1:] += q
+    out[1:, :-1] += q
+    out[:-1, :-1] += q
+    return out
+
+
+def _grad_forward(C11, C12, C22, C66, rho, h, dt, nt, src_idx, wavelet, rec_idx,
+                  C16=0.0, C26=0.0):
+    """Full-stiffness forward that stores the velocity history for the adjoint.
+
+    Identical physics to :func:`forward` (including the C16/C26 monoclinic
+    coupling via centre/corner averaging) but keeps vx/vy at every step.
+    """
     ny, nx = rho.shape
     inv_h = 1.0 / h
+    mono = np.any(C16) or np.any(C26)
     vx = np.zeros((ny, nx)); vy = np.zeros((ny, nx))
     sxx = np.zeros((ny, nx)); syy = np.zeros((ny, nx)); sxy = np.zeros((ny, nx))
     rec = np.zeros((nt, len(rec_idx)))
@@ -493,9 +628,16 @@ def _grad_forward(C11, C12, C22, C66, rho, h, dt, nt, src_idx, wavelet, rec_idx)
         vxh[n] = vx; vyh[n] = vy                      # state used by the strains
         exx = _Dbx(vx, inv_h); eyy = _Dby(vy, inv_h)
         gxy = _Dfx(vy, inv_h) + _Dfy(vx, inv_h)
-        sxx += dt * (C11 * exx + C12 * eyy)
-        syy += dt * (C12 * exx + C22 * eyy)
-        sxy += dt * (C66 * gxy)
+        sxx_rate = C11 * exx + C12 * eyy
+        syy_rate = C12 * exx + C22 * eyy
+        sxy_rate = C66 * gxy
+        if mono:
+            gc = _corner_to_centre(gxy)
+            sxx_rate = sxx_rate + C16 * gc
+            syy_rate = syy_rate + C26 * gc
+            sxy_rate = sxy_rate + C16 * _centre_to_corner(exx) \
+                                + C26 * _centre_to_corner(eyy)
+        sxx += dt * sxx_rate; syy += dt * syy_rate; sxy += dt * sxy_rate
         sxx[src_idx] += wavelet[n]; syy[src_idx] += wavelet[n]
         vx += (dt / rho) * (_Dfx(sxx, inv_h) + _Dby(sxy, inv_h))
         vy += (dt / rho) * (_Dbx(sxy, inv_h) + _Dfy(syy, inv_h))
@@ -506,30 +648,36 @@ def _grad_forward(C11, C12, C22, C66, rho, h, dt, nt, src_idx, wavelet, rec_idx)
 
 
 def misfit_and_gradient(C11, C12, C22, C66, rho, h, dt, nt,
-                        src_idx, wavelet, rec_idx, dobs):
-    """Data misfit J and its gradient w.r.t. the diagonal stiffness maps.
+                        src_idx, wavelet, rec_idx, dobs, C16=0.0, C26=0.0):
+    """Data misfit J and its gradient w.r.t. all six in-plane stiffness maps.
 
-    Returns (J, {"C11":..., "C12":..., "C22":..., "C66":...}) for one explosive
-    source recorded as pressure. Verified against finite differences to machine
-    precision (see tests/test_gradient_elastic.py).
+    Returns (J, {"C11", "C12", "C22", "C66", "C16", "C26"}) for one explosive
+    source recorded as pressure, by reverse-mode differentiation of the exact
+    discrete forward (verified against finite differences; see
+    tests/test_gradient_elastic.py and tests/test_gradient_theta.py). The
+    C16/C26 gradients are what carry c-axis orientation information.
     """
     ny, nx = rho.shape
     inv_h = 1.0 / h
+    mono = np.any(C16) or np.any(C26)
     rec, vxh, vyh = _grad_forward(C11, C12, C22, C66, rho, h, dt, nt,
-                                  src_idx, wavelet, rec_idx)
+                                  src_idx, wavelet, rec_idx, C16, C26)
     res = rec - dobs
     J = 0.5 * float(np.sum(res * res))
 
     lvx = np.zeros((ny, nx)); lvy = np.zeros((ny, nx))
     lsxx = np.zeros((ny, nx)); lsyy = np.zeros((ny, nx)); lsxy = np.zeros((ny, nx))
-    gC11 = np.zeros((ny, nx)); gC12 = np.zeros((ny, nx))
-    gC22 = np.zeros((ny, nx)); gC66 = np.zeros((ny, nx))
+    zeros = np.zeros((ny, nx))
+    g = {k: zeros.copy() for k in ("C11", "C12", "C22", "C66", "C16", "C26")}
     dtr = dt / rho
 
     for n in range(nt - 1, -1, -1):
         vx = vxh[n]; vy = vyh[n]
         exx = _Dbx(vx, inv_h); eyy = _Dby(vy, inv_h)
         gxy = _Dfx(vy, inv_h) + _Dfy(vx, inv_h)
+        gc = _corner_to_centre(gxy)
+        exk = _centre_to_corner(exx)
+        eyk = _centre_to_corner(eyy)
 
         # adjoint of the pressure recording
         for j, idx in enumerate(rec_idx):
@@ -542,18 +690,27 @@ def misfit_and_gradient(C11, C12, C22, C66, rho, h, dt, nt,
         lsyy += _DfyT(dtr * lvy, inv_h)
 
         # gradient accumulation from the stress update
-        gC11 += lsxx * dt * exx
-        gC12 += lsxx * dt * eyy + lsyy * dt * exx
-        gC22 += lsyy * dt * eyy
-        gC66 += lsxy * dt * gxy
+        g["C11"] += lsxx * dt * exx
+        g["C12"] += lsxx * dt * eyy + lsyy * dt * exx
+        g["C22"] += lsyy * dt * eyy
+        g["C66"] += lsxy * dt * gxy
+        g["C16"] += lsxx * dt * gc + lsxy * dt * exk
+        g["C26"] += lsyy * dt * gc + lsxy * dt * eyk
 
-        # adjoint of the stress update (deposits into the velocity adjoints)
-        lvx += (_DbxT(dt * C11 * lsxx, inv_h) + _DbxT(dt * C12 * lsyy, inv_h)
-                + _DfyT(dt * C66 * lsxy, inv_h))
-        lvy += (_DbyT(dt * C12 * lsxx, inv_h) + _DbyT(dt * C22 * lsyy, inv_h)
-                + _DfxT(dt * C66 * lsxy, inv_h))
+        # adjoint of the stress update (deposits into the velocity adjoints).
+        # Sensitivity routed through each strain component, including the
+        # centre/corner averaging paths of the monoclinic terms.
+        w_exx = dt * (C11 * lsxx + C12 * lsyy)
+        w_eyy = dt * (C12 * lsxx + C22 * lsyy)
+        w_gxy = dt * (C66 * lsxy)
+        if mono:
+            w_exx = w_exx + _c2k_T(dt * C16 * lsxy)
+            w_eyy = w_eyy + _c2k_T(dt * C26 * lsxy)
+            w_gxy = w_gxy + _k2c_T(dt * (C16 * lsxx + C26 * lsyy))
+        lvx += _DbxT(w_exx, inv_h) + _DfyT(w_gxy, inv_h)
+        lvy += _DbyT(w_eyy, inv_h) + _DfxT(w_gxy, inv_h)
 
-    return J, {"C11": gC11, "C12": gC12, "C22": gC22, "C66": gC66}
+    return J, g
 
 
 def invert(C11, C12, C22, C66, rho, h, dt, nt, sources, wavelet, rec_idx,
