@@ -119,12 +119,38 @@ def forward_fmc(m, geom, wavelet, dt, h, nt, sponge=None, src_list=None,
     return data
 
 
+# Time-vs-amplitude balance for the graph-space OT misfit: both coordinates
+# are normalised to O(1) (time by the window, amplitude by the per-trace
+# observed maximum), so 1.0 weights them equally.
+GSOT_ETA = 1.0
+
+
+def _hilb(x):
+    """Analytic signal along time (axis 0)."""
+    from scipy.signal import hilbert
+    return hilbert(x, axis=0)
+
+
 def _adjoint_residual(dsyn, dobs, misfit_type="l2"):
     """Misfit value and adjoint source for one transmit's data (nt, n_rx).
 
     - "l2":  least-squares waveform misfit; adjoint source is the residual.
     - "gcn": global correlation norm (normalised cross-correlation) per trace,
       a robust misfit that widens the convergence basin against cycle skipping.
+    - "envelope": L2 on Hilbert envelopes (Bozdag-style). Phase-insensitive, so
+      it tolerates waveform distortion from unmodelled physics (anisotropy,
+      elasticity, dispersion) while keeping arrival and amplitude information.
+    - "egcn": GCN on envelopes — additionally insensitive to per-trace
+      amplitude scale.
+    - "traveltime": cross-correlation traveltime lags per trace
+      (Luo & Schuster). Purely kinematic: exactly the observable that
+      direction-dependent (anisotropic) wave speeds perturb. Lag is measured
+      in samples with parabolic sub-sample refinement; the adjoint source is
+      the classic weighted time-derivative of the synthetic.
+    - "gsot": graph-space optimal transport (Metivier et al.), the state of
+      the art for cycle-skipping robustness. See the implementation note in
+      the branch below; heavier per evaluation (a Hungarian assignment per
+      trace).
     """
     if misfit_type == "l2":
         r = dsyn - dobs
@@ -139,6 +165,81 @@ def _adjoint_residual(dsyn, dobs, misfit_type="l2"):
         J = float(np.sum(1.0 - c))
         adj = -(ohat - c * shat) / ns                        # d(1 - c)/d(dsyn)
         return J, adj
+    if misfit_type == "envelope":
+        sa = _hilb(dsyn)
+        Es = np.abs(sa)
+        Eo = np.abs(_hilb(dobs))
+        dE = Es - Eo
+        J = 0.5 * float(np.sum(dE * dE))
+        Er = Es + 1e-12 * (Es.max() + 1e-300)
+        # dJ/d(dsyn) = dE*d/E - H[dE*H(d)/E]   (H^T = -H for the FFT Hilbert)
+        adj = dE * dsyn / Er - np.imag(_hilb(dE * np.imag(sa) / Er))
+        return J, adj
+    if misfit_type == "egcn":
+        sa = _hilb(dsyn)
+        Es = np.abs(sa)
+        Eo = np.abs(_hilb(dobs))
+        eps = 1e-12
+        ns = np.sqrt(np.sum(Es * Es, axis=0)) + eps
+        no = np.sqrt(np.sum(Eo * Eo, axis=0)) + eps
+        shat = Es / ns
+        ohat = Eo / no
+        c = np.sum(shat * ohat, axis=0)
+        J = float(np.sum(1.0 - c))
+        rE = -(ohat - c * shat) / ns                         # dJ/dE_syn
+        Er = Es + 1e-12 * (Es.max() + 1e-300)
+        adj = rE * dsyn / Er - np.imag(_hilb(rE * np.imag(sa) / Er))
+        return J, adj
+    if misfit_type == "gsot":
+        # Graph-space optimal transport (Metivier et al.): each trace is a
+        # point cloud {(t_i, d_i)}; an optimal assignment between synthetic
+        # and observed clouds gives J = sum_i |x_i - y_sigma(i)|^2. With the
+        # assignment fixed the misfit is quadratic, so the adjoint source is
+        # exactly 2(d - d_obs[sigma]) (chain-ruled through the per-trace
+        # amplitude normalisation). Convexifies against cycle skipping: a
+        # time-shifted arrival costs its shift, not a full cycle mismatch.
+        # Cost: one nt x nt Hungarian assignment per trace (keep nt <~ 600).
+        from scipy.optimize import linear_sum_assignment
+
+        nt, n_rx = dsyn.shape
+        tau = np.arange(nt, dtype=float)[:, None] / nt          # (nt, 1)
+        dt2 = GSOT_ETA ** 2 * (tau - tau.T) ** 2                # (nt, nt)
+        J = 0.0
+        adj = np.zeros_like(dsyn)
+        for j in range(n_rx):
+            A = float(np.max(np.abs(dobs[:, j]))) + 1e-30
+            shat = dsyn[:, j] / A
+            ohat = dobs[:, j] / A
+            C = (shat[:, None] - ohat[None, :]) ** 2 + dt2
+            rows, cols = linear_sum_assignment(C)
+            J += float(C[rows, cols].sum())
+            adj[:, j] = 2.0 * (shat - ohat[cols]) / A
+        return J, adj
+    if misfit_type == "traveltime":
+        nt, n_rx = dsyn.shape
+        J = 0.0
+        adj = np.zeros_like(dsyn)
+        for j in range(n_rx):
+            s = dsyn[:, j]
+            o = dobs[:, j]
+            if not (np.any(s) and np.any(o)):
+                continue
+            xc = np.correlate(s, o, mode="full")             # lag k at index k+nt-1
+            k = int(np.argmax(xc))
+            # parabolic sub-sample refinement
+            if 0 < k < 2 * nt - 2:
+                y0, y1, y2 = xc[k - 1], xc[k], xc[k + 1]
+                den = y0 - 2.0 * y1 + y2
+                delta = 0.5 * (y0 - y2) / den if abs(den) > 0 else 0.0
+                delta = float(np.clip(delta, -0.5, 0.5))
+            else:
+                delta = 0.0
+            lag = (k - (nt - 1)) + delta                     # samples, syn late > 0
+            J += 0.5 * lag * lag
+            sdot = np.gradient(s)
+            denom = float(np.dot(sdot, sdot)) + 1e-300
+            adj[:, j] = -lag * sdot / denom
+        return float(J), adj
     raise ValueError(f"unknown misfit_type {misfit_type!r}")
 
 
@@ -270,16 +371,22 @@ def invert(
     """
     from scipy.ndimage import gaussian_filter
 
-    if (misfit_type == "l2" and footprints is None and time_weights is None
-            and backend is not None):
-        mg = backend.misfit_and_gradient
-        mf = backend.misfit
+    if (footprints is None and time_weights is None and backend is not None
+            and misfit_type in ("l2", "gcn")):
+        # The C++ backend implements l2 and gcn (point elements); the other
+        # misfits (envelope/egcn/traveltime) run on the Python reference.
+        mg = (lambda mm, g, w, d_, h_, n_, ob, sp, sl:
+              backend.misfit_and_gradient(mm, g, w, d_, h_, n_, ob, sp, sl,
+                                          misfit_type=misfit_type))
+        mf = (lambda mm, g, w, d_, h_, n_, ob, sp, sl:
+              backend.misfit(mm, g, w, d_, h_, n_, ob, sp, sl,
+                             misfit_type=misfit_type))
     elif misfit_type == "l2" and footprints is None and time_weights is None:
         mg = misfit_and_gradient
         mf = misfit
     else:
-        # Non-L2 misfits (gcn), finite-aperture footprints, and windowed data
-        # use the Python reference; the C++ backend is point-element L2 only.
+        # Finite-aperture footprints and windowed data use the Python
+        # reference (the C++ backend is point-element only).
         mg = (lambda mm, g, w, d_, h_, n_, ob, sp, sl:
               misfit_and_gradient(mm, g, w, d_, h_, n_, ob, sp, sl, misfit_type,
                                   footprints, time_weights))

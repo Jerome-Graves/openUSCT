@@ -56,6 +56,16 @@ def _check(geom, c_field, dt, nt, f0, tag):
           f"gradient relerr {g_err:.2e}")
     assert fwd_err < 1e-9 and J_err < 1e-9 and g_err < 1e-9
 
+    # GCN misfit parity (misfit_type=1 in the C++ core).
+    Jg_py, gg_py = fwi.misfit_and_gradient(m0, geom, wavelet, dt, h, nt, d_py,
+                                           misfit_type="gcn")
+    Jg_cpp, gg_cpp = _uap.misfit_and_gradient(m0, h, dt, nt, tx_lin, rec_lin,
+                                              wavelet, d_py, misfit_type=1)
+    Jg_err = abs(Jg_py - Jg_cpp) / (abs(Jg_py) + 1e-30)
+    gg_err = np.max(np.abs(gg_py - gg_cpp)) / (np.max(np.abs(gg_py)) + 1e-30)
+    print(f"[{tag}] GCN misfit relerr {Jg_err:.2e}, gradient relerr {gg_err:.2e}")
+    assert Jg_err < 1e-9 and gg_err < 1e-9
+
     # Benchmark one misfit+gradient evaluation.
     t = time.time(); fwi.misfit_and_gradient(m0, geom, wavelet, dt, h, nt, d_py); t_py = time.time() - t
     t = time.time(); _uap.misfit_and_gradient(m0, h, dt, nt, tx_lin, rec_lin, wavelet, d_py); t_cpp = time.time() - t

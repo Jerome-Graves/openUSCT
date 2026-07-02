@@ -38,18 +38,30 @@ def forward_fmc(m, geom, wavelet, dt, h, nt, sponge=None, src_list=None):
                             int(nt), tx_lin, rec_lin, np.ascontiguousarray(wavelet, float))
 
 
-def misfit_and_gradient(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list=None):
-    """Least-squares waveform misfit and adjoint-state gradient on the C++ core."""
+_MISFIT_CODES = {"l2": 0, "gcn": 1}
+
+
+def misfit_and_gradient(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list=None,
+                        misfit_type="l2"):
+    """Waveform misfit (l2 or gcn) and adjoint-state gradient on the C++ core."""
     rec_lin, tx_lin = _tx_lin(geom, m.shape, src_list)
     J, g = _uap.misfit_and_gradient(np.ascontiguousarray(m, float), float(h), float(dt),
                                     int(nt), tx_lin, rec_lin,
                                     np.ascontiguousarray(wavelet, float),
-                                    np.ascontiguousarray(dobs, float))
+                                    np.ascontiguousarray(dobs, float),
+                                    _MISFIT_CODES[misfit_type])
     return J, g
 
 
-def misfit(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list=None):
-    """Least-squares waveform misfit only, using the C++ forward."""
+def misfit(m, geom, wavelet, dt, h, nt, dobs, sponge=None, src_list=None,
+           misfit_type="l2"):
+    """Waveform misfit only (l2 or gcn), using the C++ forward."""
     dsyn = forward_fmc(m, geom, wavelet, dt, h, nt, src_list=src_list)
-    r = dsyn - dobs
-    return 0.5 * float(np.sum(r * r))
+    if misfit_type == "l2":
+        r = dsyn - dobs
+        return 0.5 * float(np.sum(r * r))
+    eps = 1e-12
+    ns = np.sqrt(np.sum(dsyn * dsyn, axis=1)) + eps      # per-trace over time
+    no = np.sqrt(np.sum(dobs * dobs, axis=1)) + eps
+    c = np.sum((dsyn / ns[:, None]) * (dobs / no[:, None]), axis=1)
+    return float(np.sum(1.0 - c))
