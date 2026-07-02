@@ -199,7 +199,10 @@ with tab_smp:
             spec_r_mm = st.slider("Specimen radius (mm)", 5, 14, 8,
                                   help="The polycrystal cylinder fills the testing zone.")
             c_coup = st.slider("Couplant speed (m/s)", 1400, 1600, 1480, 10)
-            n_grains = st.slider("Grains", 4, 60, 14, 1)
+            n_grains = st.slider("Grains", 4, 60, 6, 1,
+                     help="Runtime of the grain-orientation inversion "
+                          "scales with the grain count; 4-6 grains "
+                          "keeps it interactive.")
             seed = st.number_input("Random seed", 0, 9999, 3, 1)
         with cs2:
             st.markdown("**Anisotropic material**")
