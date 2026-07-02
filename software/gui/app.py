@@ -44,9 +44,12 @@ from ringfwi.uarp_format import to_uarp_set
 
 # Self-heal a stale server: Streamlit re-reads this script on every rerun but
 # keeps imported modules cached, so a server started before a library change
-# serves old modules. If a required symbol is missing, purge and re-import.
+# serves old modules (locally AND on Streamlit Cloud redeploys). If any
+# required symbol is missing, purge and re-import. NOTE: when the library
+# grows a feature this app depends on, add a sentinel for it here.
 if not (hasattr(anisotropy, "TI_MATERIALS") and hasattr(td, "transmit_chain")
-        and hasattr(render3d, "polycrystal_figure")):
+        and hasattr(render3d, "polycrystal_figure")
+        and hasattr(fwi, "GSOT_ETA") and hasattr(fwi, "p_window_weights")):
     import importlib
     for _name in [m for m in list(sys.modules)
                   if m == "ringfwi" or m.startswith("ringfwi.")]:
