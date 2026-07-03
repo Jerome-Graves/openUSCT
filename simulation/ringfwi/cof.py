@@ -87,18 +87,26 @@ def make_residual(labels, ring, h, dt, nt, wavelet, src_list, dobs,
 
 
 def jacobian_iterations(residual, params0, n_iter=6, fd_step=np.radians(2.0),
-                        lam0=1e-2, tol=1e-12, verbose=False):
+                        lam0=1e-2, tol=1e-12, verbose=False, n_cols=2):
     """Levenberg-Marquardt Gauss-Newton on a finite-difference Jacobian.
 
     ``residual(params_flat) -> r``; the Jacobian is formed column-by-column by
-    forward differences with angular step ``fd_step``. The damping ``lam`` is
-    adapted per iteration (decrease on success, increase and retry on failure).
+    forward differences with step ``fd_step`` (a scalar, or a per-parameter
+    vector for mixed-unit parameterisations such as the Voronoi-seed
+    inversion's [metres, metres, metres, radians, radians] layout). The
+    damping ``lam`` is adapted per iteration (decrease on success, increase
+    and retry on failure).
 
     Returns (params, history) with ``history`` the half-SSQ misfit per accepted
     iteration (first entry = starting misfit).
     """
     p = np.asarray(params0, float).ravel().copy()
     n_par = p.size
+    fd = (np.asarray(fd_step, float).ravel() if np.ndim(fd_step)
+          else np.full(n_par, float(fd_step)))
+    assert fd.size == n_par or fd.size == 1
+    if fd.size == 1:
+        fd = np.full(n_par, fd[0])
     r = residual(p)
     J_val = 0.5 * float(r @ r)
     history = [J_val]
@@ -109,8 +117,8 @@ def jacobian_iterations(residual, params0, n_iter=6, fd_step=np.radians(2.0),
         Jac = np.empty((r.size, n_par))
         for k in range(n_par):
             pk = p.copy()
-            pk[k] += fd_step
-            Jac[:, k] = (residual(pk) - r) / fd_step
+            pk[k] += fd[k]
+            Jac[:, k] = (residual(pk) - r) / fd[k]
 
         g = Jac.T @ r
         H = Jac.T @ Jac
@@ -133,7 +141,7 @@ def jacobian_iterations(residual, params0, n_iter=6, fd_step=np.radians(2.0),
         if not accepted or J_val < tol:
             break
 
-    return p.reshape(-1, 2), history
+    return (p.reshape(-1, n_cols) if n_cols else p), history
 
 
 def axis_error_deg(a, b):
