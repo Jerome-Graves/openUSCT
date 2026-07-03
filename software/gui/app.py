@@ -1732,14 +1732,14 @@ with tab_fwi:
             vs1, vs2, vs3, vs4 = st.columns(4)
             with vs1:
                 vs_tx = st.slider("Transmits ", 2, len(src_list),
-                                  min(6, len(src_list)), key="vs_tx")
+                                  min(4, len(src_list)), key="vs_tx")
             with vs2:
                 vs_g = st.slider("Grains (seeds)", 2, 10, 6, key="vs_g",
                                  help="Number of Voronoi cells to invert. "
                                       "Need not match the truth exactly; "
                                       "extra cells can share an axis.")
             with vs3:
-                vs_sa = st.slider("Annealing steps", 0, 4000, 1500, 100,
+                vs_sa = st.slider("Annealing steps", 0, 4000, 600, 100,
                                   key="vs_sa",
                                   help="Metropolis moves over seeds and axes "
                                        "with geometric cooling; the stage "
