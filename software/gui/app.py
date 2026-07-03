@@ -1866,12 +1866,17 @@ with tab_fwi:
                         _rg = _v_res_from_traces(_d)
                         if not vjob.get("wgpu_checked"):
                             js_progress(0.05, "First GPU evaluation done; "
-                                              "verifying against the CPU "
-                                              "(one-off parity check) ...")
+                                              "verifying one transmit on the "
+                                              "CPU (one-off parity check) ...")
                             _pp = np.frombuffer(_pend["key"], dtype=float)
-                            _rc = res_fn(_pp)
-                            _rel = (np.max(np.abs(_rg - _rc))
-                                    / (np.max(np.abs(_rc)) + 1e-30))
+                            _Cm0, _rho0 = _v_maps(_pp)
+                            _ref0, _ = elastic3d.forward(
+                                _Cm0, _rho0, h, dt, nt,
+                                ring.element_index(src_sub[0]), wavelet,
+                                ring.idx, source="explosive",
+                                record="pressure", device="cpu")
+                            _rel = (np.max(np.abs(_d[0] - _ref0))
+                                    / (np.max(np.abs(_ref0)) + 1e-30))
                             if _rel < 5e-3:
                                 vjob["wgpu_checked"] = True
                                 st.caption(f"Client-GPU elastic evaluation "
@@ -1935,6 +1940,100 @@ with tab_fwi:
                             vjob["phase"] = "lm"
                             vjob["lm"]["p"] = vi.params_pack(vjob["seeds"],
                                                              vjob["axes"])
+                            if vs_lm == 0:
+                                vjob["lm"]["sub"] = "skip"
+                    elif vjob["phase"] == "anneal" and use_wgpu:
+                        # whole annealing loop as ONE main-thread GPU job --
+                        # no per-step rerun tax (the browser speed fix)
+                        if vjob.get("sa_id") is None:
+                            _msk = vs_mask
+                            _K = 1000.0 * 1480.0 ** 2
+                            _mb = np.zeros((22, n * n * n), np.float32)
+                            for _k2, _key in enumerate(vi._KEYS21):
+                                _i2 = int(_key[1]) - 1
+                                _j2 = int(_key[2]) - 1
+                                if _i2 < 3 and _j2 < 3:
+                                    _mb[_k2] = _K
+                            _rhof = np.full((n, n, n), 1000.0, np.float32)
+                            _rhof[_msk] = material["rho"]
+                            _mb[21] = _rhof.ravel()
+                            _x, _y, _z = vi.grid_coords(_msk.shape, h)
+                            _cells = np.flatnonzero(_msk.ravel())
+                            _sos = np.zeros((0, 6))
+                            if rx_filt_on:
+                                from scipy.signal import butter as _butter
+                                _sos = _butter(2, [rx_lo_x * f0, rx_hi_x * f0],
+                                               btype="bandpass", fs=fs,
+                                               output="sos")
+
+                            def _lin3(t):
+                                return (t[0] * n + t[1]) * n + t[2]
+
+                            vjob["sa_id"] = webgpu_elastic.sa_start(
+                                (n, n, n), _mb, _cells,
+                                _x[_msk], _y[_msk], _z[_msk],
+                                anisotropy.ti_stiffness_6(**material),
+                                h, dt, nt, 1.5, wavelet,
+                                [_lin3(ring.element_index(s_))
+                                 for s_ in src_sub],
+                                [_lin3(t_) for t_ in ring.idx],
+                                dobs_sub, _wtr / _trn, _sos,
+                                vjob["seeds"].ravel(),
+                                np.asarray(vjob["axes"]).ravel(),
+                                vs_sa, int(seed) + 1)
+                            vjob["sa_t0"] = time.time()
+                            st.rerun()
+                        _sst = webgpu_elastic.poll(vjob["sa_id"])
+                        vjob["k"] = _sst["prog"]
+                        if (_sst["prog"] == 0 and not _sst["done"]
+                                and time.time() - vjob["sa_t0"] > 60):
+                            st.warning("Client GPU annealing did not start; "
+                                       "continuing on CPU.")
+                            vjob["wgpu_failed"] = True
+                            vjob["sa_id"] = None
+                            st.rerun()
+                        if _sst["error"]:
+                            st.warning(f"Client GPU annealing failed "
+                                       f"({_sst['error']}); continuing on "
+                                       f"CPU.")
+                            vjob["wgpu_failed"] = True
+                            vjob["sa_id"] = None
+                            st.rerun()
+                        elif not _sst["done"]:
+                            st.rerun()
+                        else:
+                            _res = webgpu_elastic.sa_result(vjob["sa_id"])
+                            _bJ, _J0js = float(_res[0]), float(_res[1])
+                            _hn = int(_res[2])
+                            _G3 = 3 * vs_g
+                            _bs = _res[3:3 + _G3].reshape(-1, 3)
+                            _ba = _res[3 + _G3:3 + 2 * _G3].reshape(-1, 3)
+                            _rel = (abs(_J0js - vjob["J0"])
+                                    / max(vjob["J0"], 1e-30))
+                            if _rel > 5e-3:
+                                st.warning(f"GPU annealing residual parity "
+                                           f"failed (rel {_rel:.1e}); "
+                                           f"continuing on CPU.")
+                                vjob["wgpu_failed"] = True
+                                vjob["sa_id"] = None
+                                st.rerun()
+                            st.caption(f"GPU annealing verified (J0 parity "
+                                       f"rel {_rel:.1e}); best J {_bJ:.4g}")
+                            vjob["seeds"] = np.asarray(_bs, float)
+                            vjob["axes"] = np.asarray(_ba, float)
+                            vjob["bJ"] = _bJ
+                            vjob["bseeds"] = vjob["seeds"].copy()
+                            vjob["baxes"] = vjob["axes"].copy()
+                            vjob["hist"].extend(
+                                float(v) for v in _res[3 + 2 * _G3:
+                                                       3 + 2 * _G3 + _hn][1:])
+                            vjob["k"] = vs_sa
+                            vjob["phase"] = "lm"
+                            vjob["lm"] = dict(
+                                it=0, sub="base", lam=1e-2,
+                                p=vi.params_pack(vjob["seeds"],
+                                                 vjob["axes"]),
+                                r=None, J=None, Jac=None, col=0, trial=0)
                             if vs_lm == 0:
                                 vjob["lm"]["sub"] = "skip"
                     elif vjob["phase"] == "anneal":
