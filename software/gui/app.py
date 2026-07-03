@@ -2049,25 +2049,36 @@ with tab_fwi:
                                 vjob["lm"]["sub"] = "skip"
                     elif vjob["phase"] == "anneal":
                         rng = vjob["rng"]
-                        if vjob.get("prop") is None:
-                            # cache the proposal: a pending GPU evaluation must
-                            # see the SAME move on every rerun (rng state moves)
-                            vjob["prop"] = vi.sa_move(vjob["seeds"], vjob["axes"],
-                                                      vjob["_pts"], h, rng)[:2]
-                        s_t, a_t = vjob["prop"]
-                        Jt, _ = vJ(vi.params_pack(s_t, a_t))
-                        vjob["prop"] = None
-                        T = vi.sa_temperature(vjob["k"], vs_sa, vjob["J0"])
-                        if Jt < vjob["Jc"] or rng.random() < np.exp(
-                                -(Jt - vjob["Jc"]) / max(T, 1e-30)):
-                            vjob["seeds"], vjob["axes"] = s_t, a_t
-                            vjob["Jc"] = Jt
-                        if Jt < vjob["bJ"]:
-                            vjob["bJ"] = Jt
-                            vjob["bseeds"] = s_t.copy()
-                            vjob["baxes"] = a_t.copy()
-                            vjob["hist"].append(Jt)
-                        vjob["k"] += 1
+                        # several steps per rerun when evaluations are
+                        # synchronous (local): the rerun overhead is paid
+                        # once per chunk instead of per step
+                        _chunk = 1 if use_wgpu else 6
+                        for _c in range(_chunk):
+                            if vjob["k"] >= vs_sa:
+                                break
+                            if vjob.get("prop") is None:
+                                # cache the proposal: a pending GPU evaluation
+                                # must see the SAME move on every rerun
+                                vjob["prop"] = vi.sa_move(
+                                    vjob["seeds"], vjob["axes"],
+                                    vjob["_pts"], h, rng)[:2]
+                            s_t, a_t = vjob["prop"]
+                            Jt, _ = vJ(vi.params_pack(s_t, a_t))
+                            vjob["prop"] = None
+                            T = vi.sa_temperature(vjob["k"], vs_sa,
+                                                  vjob["J0"])
+                            if Jt < vjob["Jc"] or rng.random() < np.exp(
+                                    -(Jt - vjob["Jc"]) / max(T, 1e-30)):
+                                vjob["seeds"], vjob["axes"] = s_t, a_t
+                                vjob["Jc"] = Jt
+                            if Jt < vjob["bJ"]:
+                                vjob["bJ"] = Jt
+                                vjob["bseeds"] = s_t.copy()
+                                vjob["baxes"] = a_t.copy()
+                                vjob["hist"].append(Jt)
+                            vjob["k"] += 1
+                            vjob["evals"] += 1
+                        vjob["evals"] -= 1      # outer loop adds one more
                         if vjob["k"] >= vs_sa:
                             vjob["seeds"] = vjob["bseeds"].copy()
                             vjob["axes"] = vjob["baxes"].copy()
