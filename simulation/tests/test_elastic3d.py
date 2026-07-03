@@ -114,3 +114,30 @@ if __name__ == "__main__":
     test_ice_rotated_3d_axis()
     test_footprint_source_and_receive()
     print("3D elastic anisotropic checks passed")
+
+
+def test_forward_batch_matches_sequential():
+    """Batched multi-transmit forward must equal per-transmit runs exactly."""
+    n = 12
+    labels = np.zeros((n, n, n), int)
+    labels[:, :, n // 2:] = 1
+    axes = np.array([[0.3, 0.4, 0.87], [0.8, -0.2, 0.57]])
+    axes /= np.linalg.norm(axes, axis=1, keepdims=True)
+    C, rho = an.polycrystal_stiffness_3d(labels, axes)
+    h, dt, nt = 1e-3, 8e-8, 50
+    wav = np.zeros(nt)
+    wav[:16] = np.sin(np.linspace(0, 2 * np.pi, 16)) * np.hanning(16)
+    rec_idx = [(6, 9, 6), (3, 3, 3)]
+    srcs = [[((2, 6, 6), 1.0)],
+            [((9, 5, 5), 0.7), ((9, 6, 6), 0.3)],
+            [((6, 2, 6), 1.0)]]
+    seq = np.stack([elastic3d.forward(C, rho, h, dt, nt, None, wav, rec_idx,
+                               src_pts=sp, device="cpu")[0] for sp in srcs])
+    # exercise the batched code path itself on CPU (not the fallback)
+    bat = elastic3d.forward_batch(C, rho, h, dt, nt, srcs, wav, rec_idx=rec_idx,
+                           device="cpu-batch")
+    assert np.max(np.abs(seq - bat)) == 0.0
+    # and the public CPU entry point (sequential fallback)
+    bat2 = elastic3d.forward_batch(C, rho, h, dt, nt, srcs, wav, rec_idx=rec_idx,
+                            device="cpu")
+    assert np.max(np.abs(seq - bat2)) == 0.0

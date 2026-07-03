@@ -121,13 +121,9 @@ def make_residual_seeds(mask, ring, h, dt, nt, wavelet, src_list, dobs,
         seeds, axes = params_unpack(params)
         Cmaps, rho = blended_maps(seeds, axes, mask, h, base6, Cbg,
                                   1000.0, mat["rho"], tau_voxels)
-        d = np.zeros_like(dobs)
-        for i, s in enumerate(src_list):
-            rec, _ = _e3d.forward(Cmaps, rho, h, dt, nt,
-                                  ring.element_index(s), wavelet, ring.idx,
-                                  source="explosive", record="pressure",
-                                  device=device)
-            d[i] = rec
+        src_pts_list = [[(ring.element_index(s), 1.0)] for s in src_list]
+        d = _e3d.forward_batch(Cmaps, rho, h, dt, nt, src_pts_list, wavelet,
+                               rec_idx=ring.idx, device=device)
         if filter_fn is not None:
             d = filter_fn(d)
         r = (d - dobs) * (w / tr_norm)[:, None, :]
