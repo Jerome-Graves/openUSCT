@@ -260,7 +260,7 @@ def start(m, geom, wavelet, dt, h, nt, src_list):
 def poll(job_id):
     """{'done': bool, 'prog': int, 'total': int, 'error': str|None}."""
     import js
-    job = js.__OU.jobs[job_id]
+    job = getattr(js.__OU.jobs, job_id)
     return dict(done=bool(job.done), prog=int(job.prog),
                 total=int(job.total), error=(str(job.error) if job.error else None))
 
@@ -268,7 +268,7 @@ def poll(job_id):
 def result(job_id, n_tx, nt, n_rx):
     """Fetch the finished FMC data as (n_tx, nt, n_rx) float64."""
     import js
-    job = js.__OU.jobs[job_id]
+    job = getattr(js.__OU.jobs, job_id)
     buf = np.asarray(job.result.to_py(), dtype=np.float32)
-    del js.__OU.jobs[job_id]
+    js.eval("delete globalThis.__OU.jobs['" + job_id + "']")
     return buf.reshape(n_tx, nt, n_rx).astype(np.float64)

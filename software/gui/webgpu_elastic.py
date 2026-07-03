@@ -437,7 +437,7 @@ def start(Cmaps, rho, h, dt, nt, wavelet, src_pts_list, rec_idx):
 def poll(job_id):
     """{'done': bool, 'prog': int, 'total': int, 'error': str|None}."""
     import js
-    job = js.__OUE.jobs[job_id]
+    job = getattr(js.__OUE.jobs, job_id)
     return dict(done=bool(job.done), prog=int(job.prog),
                 total=int(job.total),
                 error=(str(job.error) if job.error else None))
@@ -446,7 +446,7 @@ def poll(job_id):
 def result(job_id, B, nt, n_rx):
     """Fetch the finished batched FMC as (B, nt, n_rx) float64."""
     import js
-    job = js.__OUE.jobs[job_id]
+    job = getattr(js.__OUE.jobs, job_id)
     buf = np.asarray(job.result.to_py(), dtype=np.float32)
-    del js.__OUE.jobs[job_id]
+    js.eval("delete globalThis.__OUE.jobs['" + job_id + "']")
     return buf.reshape(B, nt, n_rx).astype(np.float64)
