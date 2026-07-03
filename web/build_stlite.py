@@ -21,6 +21,7 @@ FILES = {
     "software/gui/app.py": "software/gui/app.py",
     "software/gui/hw_cosim.py": "software/gui/hw_cosim.py",
     "software/gui/webgpu_client.py": "software/gui/webgpu_client.py",
+    "software/gui/webgpu_elastic.py": "software/gui/webgpu_elastic.py",
 }
 RINGFWI = os.path.join(ROOT, "simulation", "ringfwi")
 for fn in sorted(os.listdir(RINGFWI)):

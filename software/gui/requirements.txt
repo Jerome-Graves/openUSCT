@@ -5,3 +5,4 @@ h5py>=3.8
 plotly>=5.18
 scikit-image>=0.21
 streamlit>=1.30
+joblib>=1.3
