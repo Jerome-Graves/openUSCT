@@ -249,6 +249,339 @@ fn gather(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
+function __oueEnsurePipes(dev, nt) {
+  const wgslKey = "nt" + nt;
+  globalThis.__OUE.pipes = globalThis.__OUE.pipes || {};
+  if (!globalThis.__OUE.pipes[wgslKey]) {
+    const code = __OUE_WGSL.replaceAll("P.__NT__u", String(nt) + "u");
+    const mod = dev.createShaderModule({ code: code });
+    const bgl = dev.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "uniform", hasDynamicOffset: true } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "read-only-storage" } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "storage" } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "read-only-storage" } },
+    ]});
+    const lay = dev.createPipelineLayout({ bindGroupLayouts: [bgl] });
+    const mkp = (ep) => dev.createComputePipeline({
+      layout: lay, compute: { module: mod, entryPoint: ep } });
+    globalThis.__OUE.pipes[wgslKey] = {
+      bgl: bgl, strains: mkp("strains"), stress: mkp("stress"),
+      inject: mkp("inject"), velocity: mkp("velocity"),
+      gather: mkp("gather") };
+  }
+  return globalThis.__OUE.pipes[wgslKey];
+}
+
+// Voigt upper-triangle order shared with the Python side (KEYS21).
+const __OUE_PAIRS = (() => {
+  const p = [];
+  for (let i = 0; i < 6; i++) for (let j = i; j < 6; j++) p.push([i, j]);
+  return p;
+})();
+
+function __oueMul6(A, B) {
+  const C = new Float64Array(36);
+  for (let i = 0; i < 6; i++)
+    for (let k = 0; k < 6; k++) {
+      const a = A[i * 6 + k];
+      if (a === 0) continue;
+      for (let j = 0; j < 6; j++) C[i * 6 + j] += a * B[k * 6 + j];
+    }
+  return C;
+}
+
+// Bond-rotated 6x6 stiffness for a c-axis unit vector
+// (R = Rz(azim) Ry(colat); Cp = M C M^T) -- port of the axisfield rotation.
+function __oueRot6(base6, ax) {
+  const az = Math.max(-1, Math.min(1, ax[2]));
+  const t = Math.acos(az), ph = Math.atan2(ax[1], ax[0]);
+  const ct = Math.cos(t), st = Math.sin(t);
+  const cp = Math.cos(ph), sp = Math.sin(ph);
+  const R = [cp * ct, -sp, cp * st,
+             sp * ct,  cp, sp * st,
+             -st,       0, ct];
+  const vp = [[0, 0], [1, 1], [2, 2], [1, 2], [0, 2], [0, 1]];
+  const M = new Float64Array(36);
+  for (let a = 0; a < 6; a++) {
+    const i = vp[a][0], j = vp[a][1];
+    for (let b = 0; b < 6; b++) {
+      const k = vp[b][0], l = vp[b][1];
+      let v = R[i * 3 + k] * R[j * 3 + l];
+      if (k !== l) v += R[i * 3 + l] * R[j * 3 + k];
+      M[a * 6 + b] = v;
+    }
+  }
+  const MT = new Float64Array(36);
+  for (let a = 0; a < 6; a++) for (let b = 0; b < 6; b++)
+    MT[a * 6 + b] = M[b * 6 + a];
+  return __oueMul6(__oueMul6(M, base6), MT);
+}
+
+function __oueRng(seed) {                      // mulberry32
+  let s = seed >>> 0;
+  return function () {
+    s |= 0; s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// The whole simulated-annealing loop as ONE main-thread job: proposals,
+// soft-Voronoi model building (JS), batched elastic forward (GPU), RX-filter
+// + weighted residual (JS), Metropolis -- no Streamlit rerun tax per step.
+globalThis.__oueSA = function (id, cfg) {
+  const job = { done: false, prog: 0, total: cfg.steps, error: null,
+                result: null };
+  globalThis.__OUE.jobs[id] = job;
+  const F32 = (b) => new Float32Array(
+    ((b instanceof Uint8Array) ? b.slice().buffer
+                               : new Uint8Array(b).slice().buffer));
+  const U32 = (b) => new Uint32Array(
+    ((b instanceof Uint8Array) ? b.slice().buffer
+                               : new Uint8Array(b).slice().buffer));
+  (async () => {
+    try {
+      const dev = await __oueDevice();
+      const nz = cfg.nz, ny = cfg.ny, nx = cfg.nx, nt = cfg.nt;
+      const B = cfg.B, nrx = cfg.nrx, G = cfg.G;
+      const N = nz * ny * nx, BN = B * N;
+      const matBase = F32(cfg.matBase);
+      const cells = U32(cfg.cells);
+      const px = F32(cfg.px), py = F32(cfg.py), pz = F32(cfg.pz);
+      const base6 = new Float64Array(F32(cfg.base6));
+      const wav = F32(cfg.wav);
+      const recLin = U32(cfg.recLin);
+      const src = F32(cfg.src);
+      const dobs = F32(cfg.dobs);
+      const W = F32(cfg.W);
+      const sos = F32(cfg.sos);
+      const P = cells.length;
+      const s2 = 2.0 * (cfg.tau * cfg.h) * (cfg.tau * cfg.h);
+
+      const pipe = __oueEnsurePipes(dev, nt);
+      const mk = (sz, usage) => dev.createBuffer({ size: sz, usage: usage });
+      const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+      const bufMat = mk(matBase.byteLength, ST);
+      const bufF = mk(15 * BN * 4, ST | GPUBufferUsage.COPY_SRC);
+      const bufRecL = mk(Math.max(nrx, 1) * 4, ST);
+      dev.queue.writeBuffer(bufRecL, 0, recLin);
+      const bufRec = mk(B * nt * nrx * 4, ST | GPUBufferUsage.COPY_SRC);
+      const bufSrc = mk(Math.max(src.length / 4, 1) * 16, ST);
+      dev.queue.writeBuffer(bufSrc, 0, src);
+      const uStride = 256;
+      const bufU = dev.createBuffer({ size: nt * uStride,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const staging = dev.createBuffer({ size: B * nt * nrx * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const bg = dev.createBindGroup({ layout: pipe.bgl, entries: [
+        { binding: 0, resource: { buffer: bufU, size: 64 } },
+        { binding: 1, resource: { buffer: bufMat } },
+        { binding: 2, resource: { buffer: bufF } },
+        { binding: 3, resource: { buffer: bufRecL } },
+        { binding: 4, resource: { buffer: bufRec } },
+        { binding: 5, resource: { buffer: bufSrc } },
+      ]});
+      const uData = new ArrayBuffer(nt * uStride);
+      for (let n = 0; n < nt; n++) {
+        const dv = new DataView(uData, n * uStride, 64);
+        dv.setUint32(0, nz, true); dv.setUint32(4, ny, true);
+        dv.setUint32(8, nx, true); dv.setUint32(12, N, true);
+        dv.setUint32(16, B, true); dv.setUint32(20, BN, true);
+        dv.setUint32(24, nrx, true);
+        dv.setUint32(28, src.length / 4, true);
+        dv.setUint32(32, n, true);
+        dv.setFloat32(48, wav[n], true);
+        dv.setFloat32(52, cfg.invh, true);
+        dv.setFloat32(56, cfg.dt, true);
+      }
+      dev.queue.writeBuffer(bufU, 0, uData);
+
+      const mat = matBase.slice();
+      const Cg = [];
+      const w = new Float64Array(G);
+
+      function buildMat(seeds, axes) {
+        for (let g = 0; g < G; g++) Cg[g] = __oueRot6(base6, axes[g]);
+        for (let q = 0; q < P; q++) {
+          const cx = px[q], cy = py[q], cz = pz[q];
+          let mx = -Infinity;
+          for (let g = 0; g < G; g++) {
+            const dx = cx - seeds[g][0], dy = cy - seeds[g][1],
+                  dz = cz - seeds[g][2];
+            const a = -(dx * dx + dy * dy + dz * dz) / s2;
+            w[g] = a;
+            if (a > mx) mx = a;
+          }
+          let tot = 0;
+          for (let g = 0; g < G; g++) {
+            w[g] = Math.exp(w[g] - mx); tot += w[g];
+          }
+          const cell = cells[q];
+          for (let k = 0; k < 21; k++) {
+            const i = __OUE_PAIRS[k][0], j = __OUE_PAIRS[k][1];
+            let v = 0;
+            for (let g = 0; g < G; g++) v += w[g] * Cg[g][i * 6 + j];
+            mat[k * N + cell] = v / tot;
+          }
+        }
+      }
+
+      const wgF = Math.ceil(BN / 64);
+      const wgS = Math.ceil(Math.max(src.length / 4, 1) / 64);
+      const wgR = Math.ceil(Math.max(B * nrx, 1) / 64);
+
+      async function forward() {
+        dev.queue.writeBuffer(bufMat, 0, mat);
+        const enc = dev.createCommandEncoder();
+        enc.clearBuffer(bufF);
+        enc.clearBuffer(bufRec);
+        const pass = enc.beginComputePass();
+        for (let n = 0; n < nt; n++) {
+          const off = [n * uStride];
+          pass.setPipeline(pipe.strains); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgF);
+          pass.setPipeline(pipe.stress); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgF);
+          pass.setPipeline(pipe.inject); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgS);
+          pass.setPipeline(pipe.velocity); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgF);
+          pass.setPipeline(pipe.gather); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgR);
+        }
+        pass.end();
+        enc.copyBufferToBuffer(bufRec, 0, staging, 0, B * nt * nrx * 4);
+        dev.queue.submit([enc.finish()]);
+        await staging.mapAsync(GPUMapMode.READ);
+        const out = new Float32Array(staging.getMappedRange().slice(0));
+        staging.unmap();
+        return out;
+      }
+
+      const nSec = sos.length / 6;
+      function J_of(tr) {
+        let J = 0;
+        for (let b = 0; b < B; b++) {
+          for (let r = 0; r < nrx; r++) {
+            const wt = W[b * nrx + r];
+            if (wt === 0) continue;
+            const z = [];
+            for (let sct = 0; sct < nSec; sct++) z.push([0, 0]);
+            let acc = 0;
+            for (let n = 0; n < nt; n++) {
+              let x = tr[(b * nt + n) * nrx + r];
+              for (let sct = 0; sct < nSec; sct++) {
+                const o = sct * 6;
+                const y = sos[o] * x + z[sct][0];
+                z[sct][0] = sos[o + 1] * x - sos[o + 4] * y + z[sct][1];
+                z[sct][1] = sos[o + 2] * x - sos[o + 5] * y;
+                x = y;
+              }
+              const d = (x - dobs[(b * nt + n) * nrx + r]) * wt;
+              acc += d * d;
+            }
+            J += acc;
+          }
+        }
+        return 0.5 * J;
+      }
+
+      const rng = __oueRng(cfg.rngSeed);
+      const seeds = [], axes = [];
+      const s0 = F32(cfg.seeds0), a0 = F32(cfg.axes0);
+      for (let g = 0; g < G; g++) {
+        seeds.push([s0[3 * g], s0[3 * g + 1], s0[3 * g + 2]]);
+        axes.push([a0[3 * g], a0[3 * g + 1], a0[3 * g + 2]]);
+      }
+      const clone = (arr) => arr.map(v => v.slice());
+      const norm3 = (v) => {
+        const n_ = Math.hypot(v[0], v[1], v[2]);
+        v[0] /= n_; v[1] /= n_; v[2] /= n_;
+        if (v[2] < 0) { v[0] = -v[0]; v[1] = -v[1]; v[2] = -v[2]; }
+        return v;
+      };
+      const gauss = () => {
+        const u = Math.max(rng(), 1e-12), v2 = rng();
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v2);
+      };
+
+      buildMat(seeds, axes);
+      const J0 = J_of(await forward());
+      let Jc = J0, bJ = J0;
+      let bSeeds = clone(seeds), bAxes = clone(axes);
+      const hist = [J0];
+
+      for (let k = 0; k < cfg.steps; k++) {
+        const sT = clone(seeds), aT = clone(axes);
+        const g = Math.floor(rng() * G);
+        const u = rng();
+        if (u < 0.30) {
+          const a = aT[g];
+          a[0] += 0.26 * gauss(); a[1] += 0.26 * gauss();
+          a[2] += 0.26 * gauss();
+          norm3(a);
+        } else if (u < 0.50) {
+          aT[g] = norm3([gauss(), gauss(), Math.abs(gauss())]);
+        } else if (u < 0.75) {
+          sT[g][0] += 1.5 * cfg.h * gauss();
+          sT[g][1] += 1.5 * cfg.h * gauss();
+          sT[g][2] += 1.5 * cfg.h * gauss();
+        } else if (u < 0.85) {
+          const q = Math.floor(rng() * P);
+          sT[g] = [px[q], py[q], pz[q]];
+        } else {
+          const g2 = Math.floor(rng() * G);
+          const tmp = aT[g]; aT[g] = aT[g2]; aT[g2] = tmp;
+        }
+        buildMat(sT, aT);
+        const Jt = J_of(await forward());
+        const T = J0 * 0.3 * Math.pow(1e-3 / 0.3,
+                                      k / Math.max(cfg.steps - 1, 1));
+        if (Jt < Jc || rng() < Math.exp(-(Jt - Jc) / Math.max(T, 1e-30))) {
+          for (let g2 = 0; g2 < G; g2++) {
+            seeds[g2] = sT[g2]; axes[g2] = aT[g2];
+          }
+          Jc = Jt;
+        }
+        if (Jt < bJ) {
+          bJ = Jt; bSeeds = clone(sT); bAxes = clone(aT);
+          hist.push(Jt);
+        }
+        job.prog = k + 1;
+      }
+
+      const out = new Float32Array(3 + 6 * G + hist.length);
+      out[0] = bJ; out[1] = J0; out[2] = hist.length;
+      for (let g = 0; g < G; g++) {
+        out[3 + 3 * g] = bSeeds[g][0];
+        out[3 + 3 * g + 1] = bSeeds[g][1];
+        out[3 + 3 * g + 2] = bSeeds[g][2];
+        out[3 + 3 * G + 3 * g] = bAxes[g][0];
+        out[3 + 3 * G + 3 * g + 1] = bAxes[g][1];
+        out[3 + 3 * G + 3 * g + 2] = bAxes[g][2];
+      }
+      out.set(Float32Array.from(hist), 3 + 6 * G);
+      for (const bf of [bufMat, bufF, bufRecL, bufRec, bufSrc, bufU,
+                        staging])
+        bf.destroy();
+      job.result = out;
+      job.done = true;
+    } catch (e) {
+      job.error = String(e);
+      job.done = true;
+    }
+  })();
+};
+
 globalThis.__oueStart = function (id, nz, ny, nx, B, nt, invh, dt,
                                   matB, wavB, recLinB, srcB, nrx, nsrc) {
   const job = { done: false, prog: 0, total: nt, error: null, result: null };
@@ -282,34 +615,7 @@ globalThis.__oueStart = function (id, nz, ny, nx, B, nt, invh, dt,
         size: B * nt * nrx * 4,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
-      const wgslKey = "nt" + nt;
-      globalThis.__OUE.pipes = globalThis.__OUE.pipes || {};
-      if (!globalThis.__OUE.pipes[wgslKey]) {
-        const code = __OUE_WGSL.replaceAll("P.__NT__u", String(nt) + "u");
-        const mod = dev.createShaderModule({ code: code });
-        const bgl = dev.createBindGroupLayout({ entries: [
-          { binding: 0, visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "uniform", hasDynamicOffset: true } },
-          { binding: 1, visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "read-only-storage" } },
-          { binding: 2, visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "storage" } },
-          { binding: 3, visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "read-only-storage" } },
-          { binding: 4, visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "storage" } },
-          { binding: 5, visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "read-only-storage" } },
-        ]});
-        const lay = dev.createPipelineLayout({ bindGroupLayouts: [bgl] });
-        const mkp = (ep) => dev.createComputePipeline({
-          layout: lay, compute: { module: mod, entryPoint: ep } });
-        globalThis.__OUE.pipes[wgslKey] = {
-          bgl: bgl, strains: mkp("strains"), stress: mkp("stress"),
-          inject: mkp("inject"), velocity: mkp("velocity"),
-          gather: mkp("gather") };
-      }
-      const pipe = globalThis.__OUE.pipes[wgslKey];
+      const pipe = __oueEnsurePipes(dev, nt);
       const bg = dev.createBindGroup({ layout: pipe.bgl, entries: [
         { binding: 0, resource: { buffer: bufU, size: 64 } },
         { binding: 1, resource: { buffer: bufMat } },
@@ -508,3 +814,54 @@ def result(job_id, B, nt, n_rx):
     buf = np.asarray(job.result.to_py(), dtype=np.float32)
     js.eval("delete globalThis.__OUB.jobs['" + job_id + "']")
     return buf.reshape(B, nt, n_rx).astype(np.float64)
+
+
+def sa_start(shape, mat_base, cells, px, py, pz, base6, h, dt, nt, tau,
+             wavelet, src_cells, rec_lin, dobs, W, sos, seeds0, axes0,
+             steps, rng_seed):
+    """Launch the ENTIRE annealing loop as one main-thread job.
+
+    The main thread does proposals, soft-Voronoi model building, batched GPU
+    forwards, RX-filtered weighted residuals and Metropolis acceptance -- no
+    Streamlit rerun per step. Returns a job id; poll as usual and fetch the
+    packed result with :func:`sa_result`.
+    """
+    import js
+    from pyodide.ffi import to_js
+
+    _ensure_js()
+    nz, ny, nx = (int(v) for v in shape)
+    src = np.asarray([[float(c), float(b), 1.0, 0.0]
+                      for b, c in enumerate(src_cells)], np.float32)
+    G = int(np.asarray(seeds0).size // 3)
+    _counter[0] += 1
+    job_id = f"sa{_counter[0]}"
+    msg = to_js(dict(
+        type="sa_start", id=job_id, nz=nz, ny=ny, nx=nx,
+        B=int(len(src_cells)), nt=int(nt), nrx=int(len(rec_lin)), G=G,
+        invh=float(1.0 / h), dt=float(dt), h=float(h), tau=float(tau),
+        steps=int(steps), rngSeed=int(rng_seed) & 0x7FFFFFFF,
+        matBase=np.asarray(mat_base, np.float32).ravel().tobytes(),
+        cells=np.asarray(cells, np.uint32).tobytes(),
+        px=np.asarray(px, np.float32).tobytes(),
+        py=np.asarray(py, np.float32).tobytes(),
+        pz=np.asarray(pz, np.float32).tobytes(),
+        base6=np.asarray(base6, np.float32).ravel().tobytes(),
+        wav=np.asarray(wavelet, np.float32).tobytes(),
+        recLin=np.asarray(rec_lin, np.uint32).tobytes(),
+        src=src.tobytes(),
+        dobs=np.asarray(dobs, np.float32).ravel().tobytes(),
+        W=np.asarray(W, np.float32).ravel().tobytes(),
+        sos=np.asarray(sos, np.float32).ravel().tobytes()),
+        dict_converter=js.Object.fromEntries)
+    js.__oubStart(job_id, msg)
+    return job_id
+
+
+def sa_result(job_id):
+    """Fetch a finished annealing job's packed result (flat float32)."""
+    import js
+    job = getattr(js.__OUB.jobs, job_id)
+    buf = np.asarray(job.result.to_py(), dtype=np.float32)
+    js.eval("delete globalThis.__OUB.jobs['" + job_id + "']")
+    return buf

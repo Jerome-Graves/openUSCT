@@ -112,6 +112,9 @@ __GPU_ENGINES__
           __ouStartFmc(m.id, m.nz, m.ny, m.nx, m.nt, m.invH2,
                        m.S, m.wav, m.recLin, m.srcLin, m.nrx);
           watch(m.id, globalThis.__OU.jobs[m.id]);
+        } else if (m.type === 'sa_start') {
+          __oueSA(m.id, m);
+          watch(m.id, globalThis.__OUE.jobs[m.id]);
         }
       } catch (e) {
         if (m.id) { ch.postMessage({ type: 'done', id: m.id,
