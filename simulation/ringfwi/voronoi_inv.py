@@ -156,3 +156,62 @@ def fd_steps(n_grains, h, seed_step_voxels=1.0, angle_step_deg=2.0):
     one = np.array([seed_step_voxels * h] * 3
                    + [np.radians(angle_step_deg)] * 2)
     return np.tile(one, n_grains)
+
+
+# ---------------------------------------------------------------------------
+# Simulated annealing over (seeds, axes): the basin-hopping global search the
+# greedy sweeps lack. Faithful to the stochastic spirit of transdimensional
+# Voronoi inversion (uphill moves accepted under a cooling temperature).
+# ---------------------------------------------------------------------------
+
+def mask_points(mask, h):
+    """(P, 3) physical (x, y, z) coordinates of the specimen voxels."""
+    x, y, z = grid_coords(mask.shape, h)
+    return np.stack([x[mask], y[mask], z[mask]], axis=1)
+
+
+def random_axis(rng):
+    """Uniform random c-axis on the upper hemisphere."""
+    v = rng.standard_normal(3)
+    v[2] = abs(v[2])
+    return v / np.linalg.norm(v)
+
+
+def sa_move(seeds, axes, pts, h, rng):
+    """One random annealing proposal; returns (seeds', axes', kind).
+
+    Move mix: local axis rotation, global axis redraw, local seed jitter,
+    global seed teleport (to a random specimen voxel), axis swap between two
+    grains. Local moves refine; global moves hop basins.
+    """
+    G = len(seeds)
+    seeds = np.asarray(seeds, float).copy()
+    axes = np.asarray(axes, float).copy()
+    u = rng.random()
+    g = int(rng.integers(G))
+    if u < 0.30:                                   # local axis rotation
+        a = axes[g] + 0.26 * rng.standard_normal(3)     # ~15 deg
+        if a[2] < 0:
+            a = -a
+        axes[g] = a / np.linalg.norm(a)
+        kind = "axis-local"
+    elif u < 0.50:                                 # global axis redraw
+        axes[g] = random_axis(rng)
+        kind = "axis-global"
+    elif u < 0.75:                                 # local seed jitter
+        seeds[g] = seeds[g] + 1.5 * h * rng.standard_normal(3)
+        kind = "seed-local"
+    elif u < 0.85:                                 # seed teleport
+        seeds[g] = pts[int(rng.integers(len(pts)))]
+        kind = "seed-global"
+    else:                                          # swap two grains' axes
+        g2 = int(rng.integers(G))
+        axes[[g, g2]] = axes[[g2, g]]
+        kind = "swap"
+    return seeds, axes, kind
+
+
+def sa_temperature(k, n_steps, J0, frac0=0.3, frac_end=1e-3):
+    """Geometric cooling from frac0*J0 to frac_end*J0 over n_steps."""
+    r = frac_end / frac0
+    return J0 * frac0 * (r ** (k / max(n_steps - 1, 1)))

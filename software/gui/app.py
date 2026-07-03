@@ -1664,39 +1664,37 @@ with tab_fwi:
                        "(transdimensional Voronoi tomography; parametric "
                        "level-set FWI): the unknown geometry is itself a "
                        "low-dimensional parameter -- one Voronoi seed and one "
-                       "c-axis per grain, five unknowns each. Soft-Voronoi "
-                       "blending keeps the misfit smooth in the seed "
-                       "positions; rounds of global angle sweep, greedy seed "
-                       "jitter and joint Levenberg-Marquardt, then an "
-                       "angle-only polish on the recovered hard geometry.")
-            vs1, vs2, vs3, vs4, vs5 = st.columns(5)
+                       "c-axis per grain, five unknowns each. Simulated "
+                       "annealing over seeds and axes does the basin-hopping "
+                       "(uphill moves accepted under a cooling temperature, "
+                       "as in the stochastic literature methods), then joint "
+                       "Levenberg-Marquardt and an angle-only polish on the "
+                       "recovered hard geometry.")
+            vs1, vs2, vs3, vs4 = st.columns(4)
             with vs1:
                 vs_tx = st.slider("Transmits ", 2, len(src_list),
-                                  min(6, len(src_list)), key="vs_tx")
+                                  min(8, len(src_list)), key="vs_tx")
             with vs2:
                 vs_g = st.slider("Grains (seeds)", 2, 10, 6, key="vs_g",
                                  help="Number of Voronoi cells to invert. "
                                       "Need not match the truth exactly; "
                                       "extra cells can share an axis.")
             with vs3:
-                vs_dirs = st.slider("Sweep directions", 8, 24, 12,
-                                    key="vs_dirs")
+                vs_sa = st.slider("Annealing steps", 0, 4000, 1500, 100,
+                                  key="vs_sa",
+                                  help="Metropolis moves over seeds and axes "
+                                       "with geometric cooling; the stage "
+                                       "that escapes false basins. One "
+                                       "forward evaluation per step.")
             with vs4:
-                vs_rounds = st.slider("Rounds", 1, 3, 2, key="vs_rounds",
-                                      help="Each round: angle sweep -> seed "
-                                           "jitter -> joint LM.")
-            with vs5:
                 vs_lm = st.slider("LM iterations", 0, 6, 3, key="vs_lm")
-            _vs_jit_est = vs_g * 6 * 2
-            _vs_lm_est = vs_lm * (5 * vs_g + 3)
-            vs_est = (1 + vs_rounds * (vs_g * vs_dirs + _vs_jit_est
-                                       + _vs_lm_est)
+            vs_est = (1 + vs_sa + vs_lm * (5 * vs_g + 3)
                       + 2 * (2 * vs_g + 3))
             st.caption(f"About {vs_est} forward evaluations of {vs_tx} "
                        f"transmits ({5 * vs_g} unknowns: seed xyz + 2 "
                        f"angles per grain).")
 
-            _vs_sig = (n, nt, int(seed), vs_tx, vs_g, vs_dirs, vs_rounds,
+            _vs_sig = (n, nt, int(seed), vs_tx, vs_g, vs_sa,
                        vs_lm, tuple(src_list))
             if st.button("Recover grains (seeds + axes)", type="primary",
                          disabled="vs_job" in st.session_state, key="vs_btn"):
@@ -1704,10 +1702,10 @@ with tab_fwi:
                 st.session_state.vs_job = dict(
                     sig=_vs_sig, t0=time.time(), evals=0, est=vs_est,
                     tx_sel=[int(i) for i in dict.fromkeys(sel)],
-                    phase="init", round=0, grain=0, diri=0,
-                    jd=0, jpass=0, jimp=False,
+                    phase="init", k=0, J0=None, Jc=None,
+                    rng=np.random.default_rng(int(seed) + 1),
                     seeds=None, axes=np.tile([0.0, 0.0, 1.0], (vs_g, 1)),
-                    bJ=None, hist=[],
+                    bseeds=None, baxes=None, bJ=None, hist=[],
                     lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
                             J=None, Jac=None, col=0, trial=0),
                     polish=False)
@@ -1753,8 +1751,11 @@ with tab_fwi:
                 frac = vjob["evals"] / max(vjob["est"], 1)
                 el = time.time() - vjob["t0"]
                 eta = el / max(vjob["evals"], 1) * max(vjob["est"] - vjob["evals"], 0)
+                _T = (vi.sa_temperature(vjob["k"], max(vs_sa, 1), vjob["J0"])
+                      if vjob["phase"] == "anneal" and vjob["J0"] else None)
                 msg = (f"Voronoi seeds [{vjob['phase']}"
-                       f" r{vjob['round'] + 1}/{vs_rounds}]: evaluation "
+                       + (f" T={_T:.3g}" if _T is not None else "")
+                       + f"]: evaluation "
                        f"{vjob['evals'] + 1}/~{vjob['est']}"
                        + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
                           if vjob["evals"] else " ..."))
@@ -1762,64 +1763,48 @@ with tab_fwi:
                 if not IN_BROWSER:
                     st.progress(min(frac, 1.0), text=msg)
 
-                hemi = [d if d[2] >= 0 else -d
-                        for d in _fibonacci_directions(vs_dirs,
-                                                       hemisphere=True)]
-                _jmoves = [np.array(m, float) * 2 * h for m in
-                           [(1, 0, 0), (-1, 0, 0), (0, 1, 0),
-                            (0, -1, 0), (0, 0, 1), (0, 0, -1)]]
                 done = False
                 if vjob["phase"] == "init":
                     J0, _ = vJ(vi.params_pack(vjob["seeds"], vjob["axes"]))
-                    vjob["bJ"] = J0
+                    vjob["J0"] = J0; vjob["Jc"] = J0; vjob["bJ"] = J0
+                    vjob["bseeds"] = vjob["seeds"].copy()
+                    vjob["baxes"] = vjob["axes"].copy()
                     vjob["hist"].append(J0)
-                    vjob["phase"] = "angles"
-                elif vjob["phase"] == "angles":
-                    g_i, d_i = vjob["grain"], vjob["diri"]
-                    at = vjob["axes"].copy()
-                    at[g_i] = hemi[d_i]
-                    Jt, _ = vJ(vi.params_pack(vjob["seeds"], at))
+                    vjob["_pts"] = vi.mask_points(vs_mask, h)
+                    if vs_sa > 0:
+                        vjob["phase"] = "anneal"
+                    else:
+                        vjob["phase"] = "lm"
+                        vjob["lm"]["p"] = vi.params_pack(vjob["seeds"],
+                                                         vjob["axes"])
+                        if vs_lm == 0:
+                            vjob["lm"]["sub"] = "skip"
+                elif vjob["phase"] == "anneal":
+                    rng = vjob["rng"]
+                    s_t, a_t, _kind = vi.sa_move(vjob["seeds"], vjob["axes"],
+                                                 vjob["_pts"], h, rng)
+                    Jt, _ = vJ(vi.params_pack(s_t, a_t))
+                    T = vi.sa_temperature(vjob["k"], vs_sa, vjob["J0"])
+                    if Jt < vjob["Jc"] or rng.random() < np.exp(
+                            -(Jt - vjob["Jc"]) / max(T, 1e-30)):
+                        vjob["seeds"], vjob["axes"] = s_t, a_t
+                        vjob["Jc"] = Jt
                     if Jt < vjob["bJ"]:
                         vjob["bJ"] = Jt
-                        vjob["axes"] = at
+                        vjob["bseeds"] = s_t.copy()
+                        vjob["baxes"] = a_t.copy()
                         vjob["hist"].append(Jt)
-                    vjob["diri"] += 1
-                    if vjob["diri"] >= vs_dirs:
-                        vjob["diri"] = 0
-                        vjob["grain"] += 1
-                        if vjob["grain"] >= vs_g:
-                            vjob["grain"] = 0
-                            vjob["phase"] = "jitter"
-                            vjob["jd"] = 0; vjob["jpass"] = 0
-                            vjob["jimp"] = False
-                elif vjob["phase"] == "jitter":
-                    g_i, j_i = vjob["grain"], vjob["jd"]
-                    st_ = vjob["seeds"].copy()
-                    st_[g_i] = st_[g_i] + _jmoves[j_i]
-                    Jt, _ = vJ(vi.params_pack(st_, vjob["axes"]))
-                    if Jt < vjob["bJ"]:
-                        vjob["bJ"] = Jt
-                        vjob["seeds"] = st_
-                        vjob["jimp"] = True
-                        vjob["hist"].append(Jt)
-                    vjob["jd"] += 1
-                    if vjob["jd"] >= len(_jmoves):
-                        vjob["jd"] = 0
-                        vjob["grain"] += 1
-                        if vjob["grain"] >= vs_g:
-                            vjob["grain"] = 0
-                            vjob["jpass"] += 1
-                            if vjob["jimp"] and vjob["jpass"] < 2:
-                                vjob["jimp"] = False
-                            else:
-                                vjob["phase"] = "lm"
-                                vjob["lm"] = dict(
-                                    it=0, sub="base", lam=1e-2,
-                                    p=vi.params_pack(vjob["seeds"],
-                                                     vjob["axes"]),
-                                    r=None, J=None, Jac=None, col=0, trial=0)
-                                if vs_lm == 0:
-                                    vjob["lm"]["sub"] = "skip"
+                    vjob["k"] += 1
+                    if vjob["k"] >= vs_sa:
+                        vjob["seeds"] = vjob["bseeds"].copy()
+                        vjob["axes"] = vjob["baxes"].copy()
+                        vjob["phase"] = "lm"
+                        vjob["lm"] = dict(
+                            it=0, sub="base", lam=1e-2,
+                            p=vi.params_pack(vjob["seeds"], vjob["axes"]),
+                            r=None, J=None, Jac=None, col=0, trial=0)
+                        if vs_lm == 0:
+                            vjob["lm"]["sub"] = "skip"
                 else:                                   # lm or polish
                     lm = vjob["lm"]
                     if vjob["polish"]:
@@ -1836,17 +1821,12 @@ with tab_fwi:
                             np.asarray(lm["p"]).ravel())
                         vjob["bJ"] = lm["J"] if lm["J"] is not None \
                             else vjob["bJ"]
-                        vjob["round"] += 1
-                        if vjob["round"] < vs_rounds:
-                            vjob["phase"] = "angles"
-                            vjob["grain"] = 0; vjob["diri"] = 0
-                        else:                           # angle-only polish
-                            vjob["polish"] = True
-                            vjob["phase"] = "lm"
-                            vjob["lm"] = dict(
-                                it=0, sub="base", lam=1e-2,
-                                p=cof.params_from_axes(vjob["axes"]).ravel(),
-                                r=None, J=None, Jac=None, col=0, trial=0)
+                        vjob["polish"] = True           # angle-only polish
+                        vjob["phase"] = "lm"
+                        vjob["lm"] = dict(
+                            it=0, sub="base", lam=1e-2,
+                            p=cof.params_from_axes(vjob["axes"]).ravel(),
+                            r=None, J=None, Jac=None, col=0, trial=0)
                         return False
 
                     if lm["sub"] == "skip":
