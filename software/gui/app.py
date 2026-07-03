@@ -796,8 +796,11 @@ with tab_acq:
                     job["wgpu_failed"] = True
                     st.rerun()
                 elif not stat["done"]:
-                    st.progress(0.5, text="Elastic acquisition on YOUR GPU "
-                                          "(WebGPU): all transmits batched ...")
+                    _f = stat["prog"] / max(stat["total"], 1)
+                    _m = (f"Elastic acquisition on YOUR GPU (WebGPU): step "
+                          f"{stat['prog']}/{stat['total']} ...")
+                    js_progress(_f, _m)
+                    st.progress(_f, text=_m)
                     st.rerun()
                 else:
                     gpu_data = webgpu_elastic.result(job["wgpu_id"], total,
@@ -1832,7 +1835,10 @@ with tab_fwi:
                     elif not _stat["done"]:
                         js_progress(min(vjob["evals"] / max(vjob["est"], 1),
                                         1.0),
-                                    "Evaluating on YOUR GPU (WebGPU) ...")
+                                    f"Voronoi evaluation "
+                                    f"{vjob['evals'] + 1}/~{vjob['est']} on "
+                                    f"YOUR GPU (WebGPU): step "
+                                    f"{_stat['prog']}/{_stat['total']}")
                         st.rerun()
                     else:
                         _d = webgpu_elastic.result(_pend["id"], len(src_sub),
