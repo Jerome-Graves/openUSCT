@@ -333,29 +333,46 @@ globalThis.__oueStart = function (id, nz, ny, nx, B, nt, invh, dt,
       }
       dev.queue.writeBuffer(bufU, 0, uData);
 
-      const enc = dev.createCommandEncoder();
-      enc.clearBuffer(bufF);
-      enc.clearBuffer(bufRec);
-      const pass = enc.beginComputePass();
       const wgF = Math.ceil(BN / 64);
       const wgS = Math.ceil(Math.max(nsrc, 1) / 64);
       const wgR = Math.ceil(Math.max(B * nrx, 1) / 64);
-      for (let n = 0; n < nt; n++) {
-        const off = [n * uStride];
-        pass.setPipeline(pipe.strains); pass.setBindGroup(0, bg, off);
-        pass.dispatchWorkgroups(wgF);
-        pass.setPipeline(pipe.stress); pass.setBindGroup(0, bg, off);
-        pass.dispatchWorkgroups(wgF);
-        pass.setPipeline(pipe.inject); pass.setBindGroup(0, bg, off);
-        pass.dispatchWorkgroups(wgS);
-        pass.setPipeline(pipe.velocity); pass.setBindGroup(0, bg, off);
-        pass.dispatchWorkgroups(wgF);
-        pass.setPipeline(pipe.gather); pass.setBindGroup(0, bg, off);
-        pass.dispatchWorkgroups(wgR);
+      // Chunked submission: real progress between slices (a single opaque
+      // submission shows nothing while the GPU works).
+      const CH = Math.max(1, Math.ceil(nt / 12));
+      for (let n0 = 0; n0 < nt; n0 += CH) {
+        const enc = dev.createCommandEncoder();
+        if (n0 === 0) { enc.clearBuffer(bufF); enc.clearBuffer(bufRec); }
+        const pass = enc.beginComputePass();
+        const nEnd = Math.min(n0 + CH, nt);
+        for (let n = n0; n < nEnd; n++) {
+          const off = [n * uStride];
+          pass.setPipeline(pipe.strains); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgF);
+          pass.setPipeline(pipe.stress); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgF);
+          pass.setPipeline(pipe.inject); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgS);
+          pass.setPipeline(pipe.velocity); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgF);
+          pass.setPipeline(pipe.gather); pass.setBindGroup(0, bg, off);
+          pass.dispatchWorkgroups(wgR);
+        }
+        pass.end();
+        if (nEnd >= nt) {
+          enc.copyBufferToBuffer(bufRec, 0, staging, 0, B * nt * nrx * 4);
+        }
+        dev.queue.submit([enc.finish()]);
+        await dev.queue.onSubmittedWorkDone();
+        job.prog = nEnd;
+        try {
+          globalThis.__ouProgChan = globalThis.__ouProgChan
+            || new BroadcastChannel('ou_progress');
+          globalThis.__ouProgChan.postMessage({
+            frac: nEnd / nt,
+            text: 'Elastic solve on YOUR GPU (WebGPU): step '
+                  + nEnd + '/' + nt });
+        } catch (e) {}
       }
-      pass.end();
-      enc.copyBufferToBuffer(bufRec, 0, staging, 0, B * nt * nrx * 4);
-      dev.queue.submit([enc.finish()]);
       await staging.mapAsync(GPUMapMode.READ);
       job.result = new Float32Array(staging.getMappedRange().slice(0));
       staging.unmap();
