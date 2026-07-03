@@ -256,3 +256,92 @@ def axis_error_map(colat_map, azim_map, true_axes_map, mask):
     dot = np.abs(np.sum(a * true_axes_map, axis=-1))
     err = np.degrees(np.arccos(np.clip(dot, 0.0, 1.0)))
     return np.where(mask, err, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Segment-and-re-search: escape wrong-basin regions that local descent
+# cannot rescue (the measured ~15-20 degree basin limit).
+# ---------------------------------------------------------------------------
+
+def field_misfit(colat_map, azim_map, mask, base6, Cbg, rho_bg, rho_mat,
+                 h, dt, nt, src_pts_list, wavelet, rec_groups, dobs,
+                 trace_weights=None, device="cpu"):
+    """Data misfit of an axis field, forward modelling only (no adjoint).
+
+    Same J as :func:`misfit_and_gradient_axes`, at a third of the cost --
+    what the global segment re-search evaluates per candidate direction.
+    """
+    Cmaps, rho = build_maps(colat_map, azim_map, mask, base6, Cbg,
+                            rho_bg, rho_mat)
+    J = 0.0
+    for i_tx, src_pts in enumerate(src_pts_list):
+        tw = (trace_weights[i_tx] if isinstance(trace_weights, (list, tuple))
+              else trace_weights)
+        rec, _ = _e3d.forward(Cmaps, rho, h, dt, nt, None, wavelet, None,
+                              src_pts=src_pts, rec_groups=rec_groups,
+                              device=device)
+        res = rec - dobs[i_tx]
+        if tw is not None:
+            res = res * tw
+        J += 0.5 * float(np.sum(res * res))
+    return J
+
+
+def segment_field(colat_map, azim_map, mask, n_clusters=8, seed=0,
+                  kmeans_iters=25):
+    """Cluster the axis field into emergent grains (labels, sizes, order).
+
+    K-means on the orientation-tensor embedding (c/-c safe), then connected
+    components so every segment is spatially contiguous. Returns
+    (seg_labels, sizes, order) with seg_labels = -1 outside the mask and
+    ``order`` the segment ids sorted largest first.
+    """
+    from scipy.ndimage import label as _cc_label
+    a = field_to_axes(colat_map, azim_map)[mask]
+    r2 = np.sqrt(2.0)
+    Q = np.stack([a[:, 0] ** 2, a[:, 1] ** 2, a[:, 2] ** 2,
+                  r2 * a[:, 0] * a[:, 1], r2 * a[:, 0] * a[:, 2],
+                  r2 * a[:, 1] * a[:, 2]], axis=1)
+    k = int(min(n_clusters, len(Q)))
+    rng = np.random.default_rng(seed)
+    centers = [Q[rng.integers(len(Q))]]
+    for _ in range(1, k):                                # k-means++ seeding
+        d2 = np.min(((Q[:, None, :] - np.asarray(centers)[None]) ** 2
+                     ).sum(-1), axis=1)
+        tot = d2.sum()
+        if tot <= 0:                     # all points already on a center
+            centers.append(Q[rng.integers(len(Q))])
+        else:
+            centers.append(Q[rng.choice(len(Q), p=d2 / tot)])
+    C = np.asarray(centers)
+    for _ in range(kmeans_iters):
+        idx = np.argmin(((Q[:, None, :] - C[None]) ** 2).sum(-1), axis=1)
+        for c in range(k):
+            m = idx == c
+            if m.any():
+                C[c] = Q[m].mean(0)
+    cl = np.full(mask.shape, -1, dtype=int)
+    cl[mask] = idx
+    seg = np.full(mask.shape, -1, dtype=int)
+    sizes = []
+    for c in range(k):                                   # spatial components
+        comp, ncomp = _cc_label(cl == c)
+        for j in range(1, ncomp + 1):
+            m = comp == j
+            seg[m] = len(sizes)
+            sizes.append(int(m.sum()))
+    order = [int(i) for i in np.argsort(sizes)[::-1]]
+    return seg, sizes, order
+
+
+def set_segment_axis(colat_map, azim_map, seg_labels, seg_id, direction):
+    """Copy of the field with one segment's axis set to ``direction``."""
+    d = np.asarray(direction, float)
+    d = d / np.linalg.norm(d)
+    if d[2] < 0:
+        d = -d
+    m = seg_labels == seg_id
+    colat = colat_map.copy(); azim = azim_map.copy()
+    colat[m] = np.arccos(np.clip(d[2], -1.0, 1.0))
+    azim[m] = np.arctan2(d[1], d[0])
+    return colat, azim

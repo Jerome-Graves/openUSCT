@@ -148,3 +148,48 @@ def test_gradient_descent_reduces_misfit_and_error(small_problem):
     # 2 sources x 3 receivers is heavily underdetermined, so the voxel-wise
     # error need not fall as fast as the misfit -- but it must not blow up.
     assert err1 < err0 + 1.0
+
+
+def test_field_misfit_matches_gradient_misfit(small_problem):
+    (mask, base6, Cbg, mat, h, dt, nt, wav, src_pts_list, rec_groups,
+     colat_true, azim_true, dobs) = small_problem
+    colat = np.where(mask, 0.6, 0.0)
+    azim = np.where(mask, 0.3, 0.0)
+    tw = np.ones((nt, 3)); tw[:, 1] = 0.5
+    J_fwd = af.field_misfit(colat, azim, mask, base6, Cbg, 1000.0,
+                            mat["rho"], h, dt, nt, src_pts_list, wav,
+                            rec_groups, dobs, trace_weights=tw)
+    J_adj, _, _ = af.misfit_and_gradient_axes(colat, azim, mask, base6, Cbg,
+                                              1000.0, mat["rho"], h, dt, nt,
+                                              src_pts_list, wav, rec_groups,
+                                              dobs, trace_weights=tw)
+    assert abs(J_fwd - J_adj) / J_adj < 1e-12
+
+
+def test_segment_field_finds_two_regions():
+    mask = np.zeros((10, 10, 10), bool)
+    mask[2:8, 2:8, 2:8] = True
+    colat = np.zeros(mask.shape); azim = np.zeros(mask.shape)
+    left = mask & (np.arange(10)[None, None, :] < 5)
+    right = mask & ~left
+    colat[left] = 0.2; azim[left] = 0.1
+    colat[right] = 1.3; azim[right] = -2.0
+    seg, sizes, order = af.segment_field(colat, azim, mask, n_clusters=4,
+                                         seed=1)
+    assert (seg[~mask] == -1).all()
+    # the two largest segments together cover the mask and split it cleanly
+    a, b = order[0], order[1]
+    assert sizes[a] + sizes[b] == int(mask.sum())
+    for region in (left, right):
+        ids = np.unique(seg[region])
+        assert len(ids) == 1
+
+
+def test_set_segment_axis():
+    mask = np.ones((6, 6, 6), bool)
+    seg = np.zeros(mask.shape, int); seg[:, :, 3:] = 1
+    colat = np.full(mask.shape, 0.7); azim = np.full(mask.shape, 0.2)
+    c2, a2 = af.set_segment_axis(colat, azim, seg, 1, [0.0, 0.0, -1.0])
+    assert np.allclose(c2[seg == 1], 0.0)          # -c flipped to +c
+    assert np.allclose(c2[seg == 0], 0.7)
+    assert np.allclose(a2[seg == 0], 0.2)
