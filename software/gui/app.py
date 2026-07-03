@@ -1198,6 +1198,7 @@ with tab_fwi:
             st.caption(f"About {est} forward evaluations of {cof_tx} transmits each "
                        f"({G} grains). Fewer grains in the Sample tab = much faster.")
 
+            progress_widget()
             _cof_sig = (n, nt, G, int(seed), cof_tx, cof_dirs, cof_sweeps, cof_lm,
                         tuple(src_list))
             if st.button("Recover grain orientations", type="primary",
@@ -1419,6 +1420,7 @@ with tab_fwi:
                        + f"({_nb} blocks, {int(of_mask.sum())} unknown voxels "
                          f"x 2 angles).")
 
+            progress_widget()
             _of_sig = (n, nt, int(seed), of_tx, of_div, of_dirs, of_iters,
                        float(of_sigma), int(of_seg), tuple(src_list))
             if st.button("Recover orientation field", type="primary",
@@ -1751,6 +1753,7 @@ with tab_fwi:
                        f"transmits ({5 * vs_g} unknowns: seed xyz + 2 "
                        f"angles per grain).")
 
+            progress_widget()
             _vs_sig = (n, nt, int(seed), vs_tx, vs_g, vs_sa,
                        vs_lm, tuple(src_list))
             if st.button("Recover grains (seeds + axes)", type="primary",
