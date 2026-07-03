@@ -223,11 +223,18 @@ def available():
         return False
 
 
+def _js_source():
+    """Main-thread GPU engine source (embedded in index.html at build)."""
+    return _JS
+
+
 def _ensure_js():
+    # Jobs run on the MAIN thread (stlite parks this worker, so WebGPU
+    # promises never advance here); reuse the elastic client's bridge.
     global _loaded
     if not _loaded:
-        import js
-        js.eval(_JS)
+        import webgpu_elastic
+        webgpu_elastic._ensure_js()
         _loaded = True
 
 
@@ -249,18 +256,21 @@ def start(m, geom, wavelet, dt, h, nt, src_list):
                        dtype=np.uint32)
     _counter[0] += 1
     job_id = f"fmc{_counter[0]}"
-    js.__ouStartFmc(job_id, nz, ny, nx, int(nt), float(1.0 / (h * h)),
-                    to_js(S.tobytes()),
-                    to_js(np.asarray(wavelet, np.float32).tobytes()),
-                    to_js(rec_lin.tobytes()), to_js(src_lin.tobytes()),
-                    int(len(rec_lin)))
+    msg = to_js(dict(
+        type="ac_start", id=job_id, nz=nz, ny=ny, nx=nx, nt=int(nt),
+        invH2=float(1.0 / (h * h)), S=S.tobytes(),
+        wav=np.asarray(wavelet, np.float32).tobytes(),
+        recLin=rec_lin.tobytes(), srcLin=src_lin.tobytes(),
+        nrx=int(len(rec_lin))),
+        dict_converter=js.Object.fromEntries)
+    js.__oubStart(job_id, msg)
     return job_id
 
 
 def poll(job_id):
     """{'done': bool, 'prog': int, 'total': int, 'error': str|None}."""
     import js
-    job = getattr(js.__OU.jobs, job_id)
+    job = getattr(js.__OUB.jobs, job_id)
     return dict(done=bool(job.done), prog=int(job.prog),
                 total=int(job.total), error=(str(job.error) if job.error else None))
 
@@ -268,7 +278,7 @@ def poll(job_id):
 def result(job_id, n_tx, nt, n_rx):
     """Fetch the finished FMC data as (n_tx, nt, n_rx) float64."""
     import js
-    job = getattr(js.__OU.jobs, job_id)
+    job = getattr(js.__OUB.jobs, job_id)
     buf = np.asarray(job.result.to_py(), dtype=np.float32)
-    js.eval("delete globalThis.__OU.jobs['" + job_id + "']")
+    js.eval("delete globalThis.__OUB.jobs['" + job_id + "']")
     return buf.reshape(n_tx, nt, n_rx).astype(np.float64)

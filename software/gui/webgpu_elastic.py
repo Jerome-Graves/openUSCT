@@ -391,6 +391,42 @@ globalThis.__oueStart = function (id, nz, ny, nx, B, nt, invh, dt,
 _loaded = False
 _counter = [0]
 
+# Worker-side bridge: stlite parks the Python worker so async WebGPU never
+# advances THERE, but message events demonstrably reach it (the kernel's own
+# traffic). The GPU engines therefore live on the MAIN thread (injected into
+# index.html at build time); this side only posts job requests and receives
+# progress/results over a BroadcastChannel.
+_BRIDGE_JS = r"""
+globalThis.__OUB = globalThis.__OUB || (() => {
+  const st = { jobs: {}, ch: new BroadcastChannel('ou_gpu') };
+  const handle = (m) => {
+    if (!m || !m.id) return;
+    const j = st.jobs[m.id];
+    if (!j) return;
+    if (m.type === 'prog') { j.prog = m.prog; j.total = m.total; }
+    if (m.type === 'done') {
+      j.done = true;
+      j.error = m.error || null;
+      if (m.result) { j.result = new Float32Array(m.result); }
+      j.prog = j.total;
+    }
+  };
+  // Results arrive as DIRECT worker messages (the only events this parked
+  // worker reliably dispatches); the BC listener is kept as a fallback.
+  self.addEventListener('message', (ev) => {
+    const m = ev.data;
+    if (m && m.__ougpu) { handle(m); }
+  });
+  st.ch.onmessage = (ev) => handle(ev.data);
+  return st;
+})();
+globalThis.__oubStart = function (id, msg) {
+  globalThis.__OUB.jobs[id] = { done: false, prog: 0, total: 0,
+                                error: null, result: null };
+  globalThis.__OUB.ch.postMessage(msg);
+};
+"""
+
 
 def available():
     """True inside a browser (Pyodide) whose runtime exposes WebGPU."""
@@ -402,6 +438,7 @@ def available():
 
 
 def _js_source():
+    """Main-thread GPU engine source (embedded in index.html at build)."""
     return _JS_TEMPLATE.replace("__STRESS_TERMS__", _gen_stress_terms())
 
 
@@ -409,7 +446,7 @@ def _ensure_js():
     global _loaded
     if not _loaded:
         import js
-        js.eval(_js_source())
+        js.eval(_BRIDGE_JS)
         _loaded = True
 
 
@@ -443,18 +480,22 @@ def start(Cmaps, rho, h, dt, nt, wavelet, src_pts_list, rec_idx):
 
     _counter[0] += 1
     job_id = f"el{_counter[0]}"
-    js.__oueStart(job_id, nz, ny, nx, int(B), int(nt), float(1.0 / h),
-                  float(dt), to_js(mat.tobytes()),
-                  to_js(np.asarray(wavelet, np.float32).tobytes()),
-                  to_js(rec_lin.tobytes()), to_js(src.tobytes()),
-                  int(len(rec_lin)), int(len(src)))
+    msg = to_js(dict(
+        type="el_start", id=job_id, nz=nz, ny=ny, nx=nx, B=int(B),
+        nt=int(nt), invh=float(1.0 / h), dt=float(dt),
+        mat=mat.tobytes(),
+        wav=np.asarray(wavelet, np.float32).tobytes(),
+        recLin=rec_lin.tobytes(), src=src.tobytes(),
+        nrx=int(len(rec_lin)), nsrc=int(len(src))),
+        dict_converter=js.Object.fromEntries)
+    js.__oubStart(job_id, msg)
     return job_id
 
 
 def poll(job_id):
     """{'done': bool, 'prog': int, 'total': int, 'error': str|None}."""
     import js
-    job = getattr(js.__OUE.jobs, job_id)
+    job = getattr(js.__OUB.jobs, job_id)
     return dict(done=bool(job.done), prog=int(job.prog),
                 total=int(job.total),
                 error=(str(job.error) if job.error else None))
@@ -463,7 +504,7 @@ def poll(job_id):
 def result(job_id, B, nt, n_rx):
     """Fetch the finished batched FMC as (B, nt, n_rx) float64."""
     import js
-    job = getattr(js.__OUE.jobs, job_id)
+    job = getattr(js.__OUB.jobs, job_id)
     buf = np.asarray(job.result.to_py(), dtype=np.float32)
-    js.eval("delete globalThis.__OUE.jobs['" + job_id + "']")
+    js.eval("delete globalThis.__OUB.jobs['" + job_id + "']")
     return buf.reshape(B, nt, n_rx).astype(np.float64)
