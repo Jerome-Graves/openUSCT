@@ -787,8 +787,16 @@ with tab_acq:
                     _spl = [[(ring.element_index(s), 1.0)] for s in src_list]
                     job["wgpu_id"] = webgpu_elastic.start(
                         Cmaps3, rho_map3, h, dt, nt, wavelet, _spl, ring.idx)
+                    job["wgpu_t0"] = time.time()
                     st.rerun()
                 stat = webgpu_elastic.poll(job["wgpu_id"])
+                if stat["prog"] == 0 and time.time() - job["wgpu_t0"] > 25:
+                    st.warning("Client GPU did not start within 25 s (the "
+                               "in-browser runtime cannot always reach the "
+                               "GPU); falling back to CPU.")
+                    job.pop("wgpu_id", None)
+                    job["wgpu_failed"] = True
+                    st.rerun()
                 if stat["error"]:
                     st.warning(f"Client GPU (elastic) failed ({stat['error']}); "
                                "falling back to CPU.")
@@ -1826,6 +1834,13 @@ with tab_fwi:
                 _pend = vjob.get("pend")
                 if use_wgpu and _pend is not None and _pend.get("r") is None:
                     _stat = webgpu_elastic.poll(_pend["id"])
+                    if (_stat["prog"] == 0 and not _stat["done"]
+                            and time.time() - _pend["t0"] > 25):
+                        st.warning("Client GPU did not start within 25 s; "
+                                   "using CPU for this inversion.")
+                        vjob["wgpu_failed"] = True
+                        vjob["pend"] = None
+                        st.rerun()
                     if _stat["error"]:
                         st.warning(f"Client GPU (elastic) failed "
                                    f"({_stat['error']}); using CPU.")
@@ -1874,7 +1889,7 @@ with tab_fwi:
                         if pend is None or pend["key"] != key:
                             Cm_, rho_ = _v_maps(p_)
                             vjob["pend"] = dict(
-                                key=key, r=None,
+                                key=key, r=None, t0=time.time(),
                                 id=webgpu_elastic.start(
                                     Cm_, rho_, h, dt, nt, wavelet, _spa,
                                     ring.idx))
