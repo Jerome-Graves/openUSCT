@@ -1841,12 +1841,14 @@ with tab_fwi:
                     _stat = webgpu_elastic.poll(_pend["id"])
                     if (_stat["prog"] == 0 and not _stat["done"]
                             and time.time() - _pend["t0"] > 25):
+                        vjob["wgpu_reason"] = "eval start timeout (25 s)"
                         st.warning("Client GPU did not start within 25 s; "
                                    "using CPU for this inversion.")
                         vjob["wgpu_failed"] = True
                         vjob["pend"] = None
                         st.rerun()
                     if _stat["error"]:
+                        vjob["wgpu_reason"] = f"eval error: {_stat['error']}"
                         st.warning(f"Client GPU (elastic) failed "
                                    f"({_stat['error']}); using CPU.")
                         vjob["wgpu_failed"] = True
@@ -1882,6 +1884,8 @@ with tab_fwi:
                                 st.caption(f"Client-GPU elastic evaluation "
                                            f"verified: rel {_rel:.1e}")
                             else:
+                                vjob["wgpu_reason"] = (
+                                    f"eval parity rel {_rel:.1e}")
                                 st.warning(f"Client-GPU elastic parity failed "
                                            f"(rel {_rel:.1e}); using CPU.")
                                 vjob["wgpu_failed"] = True
@@ -1910,6 +1914,9 @@ with tab_fwi:
                     r_ = res_fn(p_)
                     return 0.5 * float(r_ @ r_), r_
 
+                if vjob.get("wgpu_reason"):
+                    st.info(f"Running on CPU (GPU fallback: "
+                            f"{vjob['wgpu_reason']})")
                 frac = vjob["evals"] / max(vjob["est"], 1)
                 el = time.time() - vjob["t0"]
                 eta = el / max(vjob["evals"], 1) * max(vjob["est"] - vjob["evals"], 0)
@@ -1987,12 +1994,14 @@ with tab_fwi:
                         vjob["k"] = _sst["prog"]
                         if (_sst["prog"] == 0 and not _sst["done"]
                                 and time.time() - vjob["sa_t0"] > 60):
+                            vjob["wgpu_reason"] = "SA start timeout (60 s)"
                             st.warning("Client GPU annealing did not start; "
                                        "continuing on CPU.")
                             vjob["wgpu_failed"] = True
                             vjob["sa_id"] = None
                             st.rerun()
                         if _sst["error"]:
+                            vjob["wgpu_reason"] = f"SA error: {_sst['error']}"
                             st.warning(f"Client GPU annealing failed "
                                        f"({_sst['error']}); continuing on "
                                        f"CPU.")
@@ -2011,6 +2020,8 @@ with tab_fwi:
                             _rel = (abs(_J0js - vjob["J0"])
                                     / max(vjob["J0"], 1e-30))
                             if _rel > 5e-3:
+                                vjob["wgpu_reason"] = (
+                                    f"SA J0 parity rel {_rel:.1e}")
                                 st.warning(f"GPU annealing residual parity "
                                            f"failed (rel {_rel:.1e}); "
                                            f"continuing on CPU.")
