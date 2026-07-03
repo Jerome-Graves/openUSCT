@@ -463,6 +463,14 @@ def misfit_and_gradient(C, rho, h, dt, nt, src_idx, wavelet, rec_idx, dobs,
     return J, g
 
 
+def _fwd_worker(args):
+    """One transmit of the batched CPU fallback (runs in a worker process)."""
+    C, rho, h, dt, nt, wavelet, rec_idx, src_pts, rec_groups = args
+    rec, _ = forward(C, rho, h, dt, nt, None, wavelet, rec_idx,
+                     src_pts=src_pts, rec_groups=rec_groups, device="cpu")
+    return rec
+
+
 def forward_batch(C, rho, h, dt, nt, src_pts_list, wavelet, rec_idx=None,
                   rec_groups=None, device="auto"):
     """All transmits of an FMC in ONE batched array pass (explosive/pressure).
@@ -495,13 +503,33 @@ def forward_batch(C, rho, h, dt, nt, src_pts_list, wavelet, rec_idx=None,
         dtype = np.float64
     else:
         # A CPU batch is math-bound and beats nothing (measured 0.5x), so
-        # fall back to the sequential verified forward per transmit.
+        # fall back to the verified per-transmit forward. For real problems
+        # the transmits run across CPU CORES via a persistent process pool
+        # (threads gain nothing here: the small per-op arrays keep NumPy in
+        # GIL-held dispatch). Tiny problems and Pyodide/WASM (no processes)
+        # stay sequential.
+        import sys
         n_rx = (len(rec_groups) if rec_groups is not None else len(rec_idx))
         rec = np.zeros((B, nt, n_rx))
-        for b, sp in enumerate(src_pts_list):
+        big = B * rho_h.size * nt >= 10_000_000
+        if B > 1 and big and sys.platform != "emscripten":
+            try:
+                import os
+                from joblib import Parallel, delayed
+                args = [(C, rho_h, h, dt, nt, wavelet, rec_idx,
+                         src_pts_list[b], rec_groups) for b in range(B)]
+                outs = Parallel(n_jobs=min(os.cpu_count() or 1, 8),
+                                backend="loky")(
+                    delayed(_fwd_worker)(a) for a in args)
+                for b, r in enumerate(outs):
+                    rec[b] = r
+                return rec
+            except Exception:
+                pass
+        for b in range(B):
             rec[b], _ = forward(C, rho, h, dt, nt, None, wavelet, rec_idx,
-                                src_pts=sp, rec_groups=rec_groups,
-                                device="cpu")
+                                src_pts=src_pts_list[b],
+                                rec_groups=rec_groups, device="cpu")
         return rec
 
     def cij_host(i, j):

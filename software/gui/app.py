@@ -75,6 +75,7 @@ _rw._loaded_mtime = _lib_mtime
 
 import hw_cosim
 import webgpu_client
+import webgpu_elastic
 
 try:
     import uap as _backend
@@ -772,6 +773,49 @@ with tab_acq:
                                    f"CPU reference: rel {rel:.1e}")
                     else:
                         st.warning(f"Client-GPU parity check failed "
+                                   f"(rel {rel:.1e}); falling back to CPU.")
+                        job.pop("wgpu_id", None)
+                        job["wgpu_failed"] = True
+                        st.rerun()
+            can_wgpu_el = (poly and footprints is None
+                           and not job.get("wgpu_failed")
+                           and webgpu_elastic.available())
+            if can_wgpu_el and job["i"] == 0:
+                # Elastic WebGPU: the whole batched anisotropic FMC on the
+                # visitor's GPU, verified against one CPU transmit.
+                if "wgpu_id" not in job:
+                    _spl = [[(ring.element_index(s), 1.0)] for s in src_list]
+                    job["wgpu_id"] = webgpu_elastic.start(
+                        Cmaps3, rho_map3, h, dt, nt, wavelet, _spl, ring.idx)
+                    st.rerun()
+                stat = webgpu_elastic.poll(job["wgpu_id"])
+                if stat["error"]:
+                    st.warning(f"Client GPU (elastic) failed ({stat['error']}); "
+                               "falling back to CPU.")
+                    job.pop("wgpu_id", None)
+                    job["wgpu_failed"] = True
+                    st.rerun()
+                elif not stat["done"]:
+                    st.progress(0.5, text="Elastic acquisition on YOUR GPU "
+                                          "(WebGPU): all transmits batched ...")
+                    st.rerun()
+                else:
+                    gpu_data = webgpu_elastic.result(job["wgpu_id"], total,
+                                                     nt, n_elem)
+                    ref, _ = elastic3d.forward(
+                        Cmaps3, rho_map3, h, dt, nt,
+                        ring.element_index(src_list[0]), wavelet, ring.idx,
+                        source="explosive", record="pressure", device="cpu")
+                    rel = (np.max(np.abs(gpu_data[0] - ref))
+                           / (np.max(np.abs(ref)) + 1e-30))
+                    if rel < 2e-3:
+                        job["data"][:] = gpu_data
+                        job["i"] = total
+                        i = total
+                        st.caption(f"Client-GPU elastic acquisition verified "
+                                   f"against the CPU reference: rel {rel:.1e}")
+                    else:
+                        st.warning(f"Client-GPU elastic parity check failed "
                                    f"(rel {rel:.1e}); falling back to CPU.")
                         job.pop("wgpu_id", None)
                         job["wgpu_failed"] = True
@@ -1734,19 +1778,103 @@ with tab_fwi:
                         lab_now, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
                         material=material,
                         filter_fn=lambda d: apply_rx_filter(d, axis=1))
-
-                    def vJ(params_flat):
-                        r_ = res_fn(np.asarray(params_flat))
-                        return 0.5 * float(r_ @ r_), r_
                 else:
+                    lab_now = None
                     res_fn = vi.make_residual_seeds(
                         vs_mask, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
                         material=material,
                         filter_fn=lambda d: apply_rx_filter(d, axis=1))
 
-                    def vJ(params_flat):
-                        r_ = res_fn(np.asarray(params_flat))
-                        return 0.5 * float(r_ @ r_), r_
+                # --- evaluation backend: CPU (sync) or client GPU (async) ---
+                use_wgpu = (IN_BROWSER and not vjob.get("wgpu_failed")
+                            and webgpu_elastic.available())
+                _spa = [[(ring.element_index(s), 1.0)] for s in src_sub]
+                _vtrn = np.sqrt(np.sum(dobs_sub ** 2, axis=1)) + 1e-30
+                _vwtr = np.ones_like(_vtrn)
+                for _i, _s in enumerate(src_sub):
+                    _vwtr[_i, _s] = 0.0
+                _vs_base6 = anisotropy.ti_stiffness_6(**material)
+                _vKbg = 1000.0 * 1480.0 ** 2
+                _vs_Cbg = {k: np.full((n, n, n),
+                                      _vKbg if (int(k[1]) <= 3
+                                                and int(k[2]) <= 3) else 0.0)
+                           for k in vi._KEYS21}
+
+                def _v_maps(p_):
+                    if vjob["polish"]:
+                        axes_p = cof.axes_from_params(
+                            np.asarray(p_).reshape(-1, 2))
+                        return anisotropy.polycrystal_stiffness_3d(
+                            lab_now, axes_p, material=material)
+                    seeds_p, axes_p = vi.params_unpack(np.asarray(p_).ravel())
+                    return vi.blended_maps(seeds_p, axes_p, vs_mask, h,
+                                           _vs_base6, _vs_Cbg, 1000.0,
+                                           material["rho"])
+
+                def _v_res_from_traces(d):
+                    d = apply_rx_filter(d, axis=1)
+                    return ((d - dobs_sub)
+                            * (_vwtr / _vtrn)[:, None, :]).ravel()
+
+                class _PendingEval(Exception):
+                    pass
+
+                # advance a pending GPU evaluation before the phase logic
+                _pend = vjob.get("pend")
+                if use_wgpu and _pend is not None and _pend.get("r") is None:
+                    _stat = webgpu_elastic.poll(_pend["id"])
+                    if _stat["error"]:
+                        st.warning(f"Client GPU (elastic) failed "
+                                   f"({_stat['error']}); using CPU.")
+                        vjob["wgpu_failed"] = True
+                        vjob["pend"] = None
+                        st.rerun()
+                    elif not _stat["done"]:
+                        js_progress(min(vjob["evals"] / max(vjob["est"], 1),
+                                        1.0),
+                                    "Evaluating on YOUR GPU (WebGPU) ...")
+                        st.rerun()
+                    else:
+                        _d = webgpu_elastic.result(_pend["id"], len(src_sub),
+                                                   nt, len(ring.idx))
+                        _rg = _v_res_from_traces(_d)
+                        if not vjob.get("wgpu_checked"):
+                            _pp = np.frombuffer(_pend["key"], dtype=float)
+                            _rc = res_fn(_pp)
+                            _rel = (np.max(np.abs(_rg - _rc))
+                                    / (np.max(np.abs(_rc)) + 1e-30))
+                            if _rel < 5e-3:
+                                vjob["wgpu_checked"] = True
+                                st.caption(f"Client-GPU elastic evaluation "
+                                           f"verified: rel {_rel:.1e}")
+                            else:
+                                st.warning(f"Client-GPU elastic parity failed "
+                                           f"(rel {_rel:.1e}); using CPU.")
+                                vjob["wgpu_failed"] = True
+                                vjob["pend"] = None
+                                st.rerun()
+                        _pend["r"] = _rg
+
+                def vJ(params_flat):
+                    p_ = np.asarray(params_flat, float).ravel()
+                    if use_wgpu:
+                        key = p_.tobytes()
+                        pend = vjob.get("pend")
+                        if (pend is not None and pend["key"] == key
+                                and pend.get("r") is not None):
+                            r_ = pend["r"]
+                            vjob["pend"] = None
+                            return 0.5 * float(r_ @ r_), r_
+                        if pend is None or pend["key"] != key:
+                            Cm_, rho_ = _v_maps(p_)
+                            vjob["pend"] = dict(
+                                key=key, r=None,
+                                id=webgpu_elastic.start(
+                                    Cm_, rho_, h, dt, nt, wavelet, _spa,
+                                    ring.idx))
+                        raise _PendingEval()
+                    r_ = res_fn(p_)
+                    return 0.5 * float(r_ @ r_), r_
 
                 frac = vjob["evals"] / max(vjob["est"], 1)
                 el = time.time() - vjob["t0"]
@@ -1763,113 +1891,121 @@ with tab_fwi:
                 if not IN_BROWSER:
                     st.progress(min(frac, 1.0), text=msg)
 
-                done = False
-                if vjob["phase"] == "init":
-                    J0, _ = vJ(vi.params_pack(vjob["seeds"], vjob["axes"]))
-                    vjob["J0"] = J0; vjob["Jc"] = J0; vjob["bJ"] = J0
-                    vjob["bseeds"] = vjob["seeds"].copy()
-                    vjob["baxes"] = vjob["axes"].copy()
-                    vjob["hist"].append(J0)
-                    vjob["_pts"] = vi.mask_points(vs_mask, h)
-                    if vs_sa > 0:
-                        vjob["phase"] = "anneal"
-                    else:
-                        vjob["phase"] = "lm"
-                        vjob["lm"]["p"] = vi.params_pack(vjob["seeds"],
-                                                         vjob["axes"])
-                        if vs_lm == 0:
-                            vjob["lm"]["sub"] = "skip"
-                elif vjob["phase"] == "anneal":
-                    rng = vjob["rng"]
-                    s_t, a_t, _kind = vi.sa_move(vjob["seeds"], vjob["axes"],
-                                                 vjob["_pts"], h, rng)
-                    Jt, _ = vJ(vi.params_pack(s_t, a_t))
-                    T = vi.sa_temperature(vjob["k"], vs_sa, vjob["J0"])
-                    if Jt < vjob["Jc"] or rng.random() < np.exp(
-                            -(Jt - vjob["Jc"]) / max(T, 1e-30)):
-                        vjob["seeds"], vjob["axes"] = s_t, a_t
-                        vjob["Jc"] = Jt
-                    if Jt < vjob["bJ"]:
-                        vjob["bJ"] = Jt
-                        vjob["bseeds"] = s_t.copy()
-                        vjob["baxes"] = a_t.copy()
-                        vjob["hist"].append(Jt)
-                    vjob["k"] += 1
-                    if vjob["k"] >= vs_sa:
-                        vjob["seeds"] = vjob["bseeds"].copy()
-                        vjob["axes"] = vjob["baxes"].copy()
-                        vjob["phase"] = "lm"
-                        vjob["lm"] = dict(
-                            it=0, sub="base", lam=1e-2,
-                            p=vi.params_pack(vjob["seeds"], vjob["axes"]),
-                            r=None, J=None, Jac=None, col=0, trial=0)
-                        if vs_lm == 0:
-                            vjob["lm"]["sub"] = "skip"
-                else:                                   # lm or polish
-                    lm = vjob["lm"]
-                    if vjob["polish"]:
-                        fdv = np.radians(2.0)
-                    else:
-                        fdv = vi.fd_steps(vs_g, h)
-
-                    def _finish_lm():
-                        if vjob["polish"]:
-                            vjob["axes"] = cof.axes_from_params(
-                                np.asarray(lm["p"]).reshape(-1, 2))
-                            return True                 # fully done
-                        vjob["seeds"], vjob["axes"] = vi.params_unpack(
-                            np.asarray(lm["p"]).ravel())
-                        vjob["bJ"] = lm["J"] if lm["J"] is not None \
-                            else vjob["bJ"]
-                        vjob["polish"] = True           # angle-only polish
-                        vjob["phase"] = "lm"
-                        vjob["lm"] = dict(
-                            it=0, sub="base", lam=1e-2,
-                            p=cof.params_from_axes(vjob["axes"]).ravel(),
-                            r=None, J=None, Jac=None, col=0, trial=0)
-                        return False
-
-                    if lm["sub"] == "skip":
-                        done = _finish_lm()
-                    elif lm["sub"] == "base":
-                        lm["J"], lm["r"] = vJ(lm["p"])
-                        vjob["hist"].append(lm["J"])
-                        lm["Jac"] = np.empty((lm["r"].size, lm["p"].size))
-                        lm["sub"] = "col"; lm["col"] = 0
-                    elif lm["sub"] == "col":
-                        k = lm["col"]
-                        pk = np.asarray(lm["p"], float).copy()
-                        fk = fdv if np.ndim(fdv) == 0 else fdv[k]
-                        pk[k] += fk
-                        _, rk = vJ(pk)
-                        lm["Jac"][:, k] = (rk - lm["r"]) / fk
-                        lm["col"] += 1
-                        if lm["col"] >= np.asarray(lm["p"]).size:
-                            lm["sub"] = "trial"; lm["trial"] = 0
-                    else:                               # trial
-                        Jc = lm["Jac"]
-                        gv = Jc.T @ lm["r"]
-                        Hm = Jc.T @ Jc
-                        step = np.linalg.solve(
-                            Hm + lm["lam"] * np.diag(np.diag(Hm) + 1e-30),
-                            -gv)
-                        p_try = np.asarray(lm["p"]) + step
-                        J_try, _ = vJ(p_try)
-                        n_lm = 2 if vjob["polish"] else vs_lm
-                        if J_try < lm["J"]:
-                            lm["p"] = p_try
-                            lm["lam"] = max(lm["lam"] / 3.0, 1e-8)
-                            lm["it"] += 1
-                            lm["sub"] = "base"
-                            if lm["it"] >= n_lm:
-                                done = _finish_lm()
+                try:
+                    done = False
+                    if vjob["phase"] == "init":
+                        J0, _ = vJ(vi.params_pack(vjob["seeds"], vjob["axes"]))
+                        vjob["J0"] = J0; vjob["Jc"] = J0; vjob["bJ"] = J0
+                        vjob["bseeds"] = vjob["seeds"].copy()
+                        vjob["baxes"] = vjob["axes"].copy()
+                        vjob["hist"].append(J0)
+                        vjob["_pts"] = vi.mask_points(vs_mask, h)
+                        if vs_sa > 0:
+                            vjob["phase"] = "anneal"
                         else:
-                            lm["lam"] *= 5.0
-                            lm["trial"] += 1
-                            if lm["trial"] >= 5:
-                                done = _finish_lm()
-                vjob["evals"] += 1
-                if not done:
+                            vjob["phase"] = "lm"
+                            vjob["lm"]["p"] = vi.params_pack(vjob["seeds"],
+                                                             vjob["axes"])
+                            if vs_lm == 0:
+                                vjob["lm"]["sub"] = "skip"
+                    elif vjob["phase"] == "anneal":
+                        rng = vjob["rng"]
+                        if vjob.get("prop") is None:
+                            # cache the proposal: a pending GPU evaluation must
+                            # see the SAME move on every rerun (rng state moves)
+                            vjob["prop"] = vi.sa_move(vjob["seeds"], vjob["axes"],
+                                                      vjob["_pts"], h, rng)[:2]
+                        s_t, a_t = vjob["prop"]
+                        Jt, _ = vJ(vi.params_pack(s_t, a_t))
+                        vjob["prop"] = None
+                        T = vi.sa_temperature(vjob["k"], vs_sa, vjob["J0"])
+                        if Jt < vjob["Jc"] or rng.random() < np.exp(
+                                -(Jt - vjob["Jc"]) / max(T, 1e-30)):
+                            vjob["seeds"], vjob["axes"] = s_t, a_t
+                            vjob["Jc"] = Jt
+                        if Jt < vjob["bJ"]:
+                            vjob["bJ"] = Jt
+                            vjob["bseeds"] = s_t.copy()
+                            vjob["baxes"] = a_t.copy()
+                            vjob["hist"].append(Jt)
+                        vjob["k"] += 1
+                        if vjob["k"] >= vs_sa:
+                            vjob["seeds"] = vjob["bseeds"].copy()
+                            vjob["axes"] = vjob["baxes"].copy()
+                            vjob["phase"] = "lm"
+                            vjob["lm"] = dict(
+                                it=0, sub="base", lam=1e-2,
+                                p=vi.params_pack(vjob["seeds"], vjob["axes"]),
+                                r=None, J=None, Jac=None, col=0, trial=0)
+                            if vs_lm == 0:
+                                vjob["lm"]["sub"] = "skip"
+                    else:                                   # lm or polish
+                        lm = vjob["lm"]
+                        if vjob["polish"]:
+                            fdv = np.radians(2.0)
+                        else:
+                            fdv = vi.fd_steps(vs_g, h)
+
+                        def _finish_lm():
+                            if vjob["polish"]:
+                                vjob["axes"] = cof.axes_from_params(
+                                    np.asarray(lm["p"]).reshape(-1, 2))
+                                return True                 # fully done
+                            vjob["seeds"], vjob["axes"] = vi.params_unpack(
+                                np.asarray(lm["p"]).ravel())
+                            vjob["bJ"] = lm["J"] if lm["J"] is not None \
+                                else vjob["bJ"]
+                            vjob["polish"] = True           # angle-only polish
+                            vjob["phase"] = "lm"
+                            vjob["lm"] = dict(
+                                it=0, sub="base", lam=1e-2,
+                                p=cof.params_from_axes(vjob["axes"]).ravel(),
+                                r=None, J=None, Jac=None, col=0, trial=0)
+                            return False
+
+                        if lm["sub"] == "skip":
+                            done = _finish_lm()
+                        elif lm["sub"] == "base":
+                            lm["J"], lm["r"] = vJ(lm["p"])
+                            vjob["hist"].append(lm["J"])
+                            lm["Jac"] = np.empty((lm["r"].size, lm["p"].size))
+                            lm["sub"] = "col"; lm["col"] = 0
+                        elif lm["sub"] == "col":
+                            k = lm["col"]
+                            pk = np.asarray(lm["p"], float).copy()
+                            fk = fdv if np.ndim(fdv) == 0 else fdv[k]
+                            pk[k] += fk
+                            _, rk = vJ(pk)
+                            lm["Jac"][:, k] = (rk - lm["r"]) / fk
+                            lm["col"] += 1
+                            if lm["col"] >= np.asarray(lm["p"]).size:
+                                lm["sub"] = "trial"; lm["trial"] = 0
+                        else:                               # trial
+                            Jc = lm["Jac"]
+                            gv = Jc.T @ lm["r"]
+                            Hm = Jc.T @ Jc
+                            step = np.linalg.solve(
+                                Hm + lm["lam"] * np.diag(np.diag(Hm) + 1e-30),
+                                -gv)
+                            p_try = np.asarray(lm["p"]) + step
+                            J_try, _ = vJ(p_try)
+                            n_lm = 2 if vjob["polish"] else vs_lm
+                            if J_try < lm["J"]:
+                                lm["p"] = p_try
+                                lm["lam"] = max(lm["lam"] / 3.0, 1e-8)
+                                lm["it"] += 1
+                                lm["sub"] = "base"
+                                if lm["it"] >= n_lm:
+                                    done = _finish_lm()
+                            else:
+                                lm["lam"] *= 5.0
+                                lm["trial"] += 1
+                                if lm["trial"] >= 5:
+                                    done = _finish_lm()
+                    vjob["evals"] += 1
+                    if not done:
+                        st.rerun()
+                except _PendingEval:
                     st.rerun()
                 js_progress(done=True)
                 lab_f = vi.hard_labels(vjob["seeds"], vs_mask, h)
