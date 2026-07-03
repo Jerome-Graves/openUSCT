@@ -358,6 +358,12 @@ def _in_browser():
 IN_BROWSER = _in_browser()
 
 
+def hms(sec):
+    """Format a duration in seconds as h:mm:ss."""
+    s_ = int(round(max(float(sec), 0.0)))
+    return f"{s_ // 3600}:{s_ % 3600 // 60:02d}:{s_ % 60:02d}"
+
+
 def js_progress(frac=0.0, text="", done=False):
     """Post progress to the client-side widget (browser build only).
 
@@ -774,7 +780,7 @@ with tab_acq:
                 elapsed = time.time() - job["t0"]
                 eta = elapsed / max(i, 1) * (total - i)
                 msg = (f"Acquisition: transmit {i + 1}/{total}"
-                       + (f" ({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)"
+                       + (f" ({hms(elapsed)} elapsed, ~{hms(eta)} remaining)"
                           if i else " ..."))
                 js_progress(i / total, msg)         # paints even while Python runs
                 if not IN_BROWSER:
@@ -1022,7 +1028,7 @@ with tab_fwi:
                 elapsed = time.time() - fjob["t0"]
                 eta = elapsed / max(it, 1) * (n_iter - it)
                 msg = (f"FWI: iteration {it + 1}/{n_iter} ({mtype.upper()})"
-                       + (f" ({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)"
+                       + (f" ({hms(elapsed)} elapsed, ~{hms(eta)} remaining)"
                           if it else " ..."))
                 js_progress(it / n_iter, msg)       # paints even while Python runs
                 if not IN_BROWSER:
@@ -1176,7 +1182,7 @@ with tab_fwi:
                 eta = el / max(cjob["evals"], 1) * max(cjob["est"] - cjob["evals"], 0)
                 msg = (f"COF inversion [{cjob['phase']}]: evaluation "
                        f"{cjob['evals'] + 1}/~{cjob['est']}"
-                       + (f" ({el:.0f}s elapsed, ~{eta:.0f}s remaining)"
+                       + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
                           if cjob["evals"] else " ..."))
                 js_progress(min(frac, 1.0), msg)
                 if not IN_BROWSER:
@@ -1274,7 +1280,7 @@ with tab_fwi:
             if cres is not None:
                 errs = cres["errs"]
                 st.success(f"Recovered {G} grain orientations in {cres['evals']} "
-                           f"evaluations ({cres['secs']:.0f}s): mean axis error "
+                           f"evaluations ({hms(cres['secs'])}): mean axis error "
                            f"{np.mean(errs):.1f} deg, max {np.max(errs):.1f} deg")
                 rows = ["| grain | true axis | recovered | error |",
                         "|---|---|---|---|"]
@@ -1404,7 +1410,7 @@ with tab_fwi:
                 eta = el / max(ojob["evals"], 1) * max(ojob["est"] - ojob["evals"], 0)
                 msg = (f"Orientation field [{ojob['phase']}]: evaluation "
                        f"{ojob['evals'] + 1}/~{ojob['est']}"
-                       + (f" ({el:.0f}s elapsed, ~{eta:.0f}s remaining)"
+                       + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
                           if ojob["evals"] else " ..."))
                 js_progress(min(frac, 1.0), msg)
                 if not IN_BROWSER:
@@ -1595,7 +1601,7 @@ with tab_fwi:
                 from plotly.subplots import make_subplots
                 st.success(f"Orientation field recovered with no geometry "
                            f"prior in {ores['evals']} evaluations "
-                           f"({ores['secs']:.0f}s): mean axis error "
+                           f"({hms(ores['secs'])}): mean axis error "
                            f"{ores['mean_err']:.1f} deg, "
                            f"max {ores['max_err']:.1f} deg")
                 mmv = np.arange(n) * h * 1e3
@@ -1650,3 +1656,311 @@ with tab_fwi:
                                  xaxis_title="accepted update", height=260,
                                  margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fo, width="stretch")
+
+            st.divider()
+            st.subheader("Voronoi-seed inversion (unknown geometry, "
+                         "parametric)")
+            st.caption("The literature answer to the voxel null space "
+                       "(transdimensional Voronoi tomography; parametric "
+                       "level-set FWI): the unknown geometry is itself a "
+                       "low-dimensional parameter -- one Voronoi seed and one "
+                       "c-axis per grain, five unknowns each. Soft-Voronoi "
+                       "blending keeps the misfit smooth in the seed "
+                       "positions; rounds of global angle sweep, greedy seed "
+                       "jitter and joint Levenberg-Marquardt, then an "
+                       "angle-only polish on the recovered hard geometry.")
+            vs1, vs2, vs3, vs4, vs5 = st.columns(5)
+            with vs1:
+                vs_tx = st.slider("Transmits ", 2, len(src_list),
+                                  min(6, len(src_list)), key="vs_tx")
+            with vs2:
+                vs_g = st.slider("Grains (seeds)", 2, 10, 6, key="vs_g",
+                                 help="Number of Voronoi cells to invert. "
+                                      "Need not match the truth exactly; "
+                                      "extra cells can share an axis.")
+            with vs3:
+                vs_dirs = st.slider("Sweep directions", 8, 24, 12,
+                                    key="vs_dirs")
+            with vs4:
+                vs_rounds = st.slider("Rounds", 1, 3, 2, key="vs_rounds",
+                                      help="Each round: angle sweep -> seed "
+                                           "jitter -> joint LM.")
+            with vs5:
+                vs_lm = st.slider("LM iterations", 0, 6, 3, key="vs_lm")
+            _vs_jit_est = vs_g * 6 * 2
+            _vs_lm_est = vs_lm * (5 * vs_g + 3)
+            vs_est = (1 + vs_rounds * (vs_g * vs_dirs + _vs_jit_est
+                                       + _vs_lm_est)
+                      + 2 * (2 * vs_g + 3))
+            st.caption(f"About {vs_est} forward evaluations of {vs_tx} "
+                       f"transmits ({5 * vs_g} unknowns: seed xyz + 2 "
+                       f"angles per grain).")
+
+            _vs_sig = (n, nt, int(seed), vs_tx, vs_g, vs_dirs, vs_rounds,
+                       vs_lm, tuple(src_list))
+            if st.button("Recover grains (seeds + axes)", type="primary",
+                         disabled="vs_job" in st.session_state, key="vs_btn"):
+                sel = np.linspace(0, len(src_list) - 1, vs_tx).astype(int)
+                st.session_state.vs_job = dict(
+                    sig=_vs_sig, t0=time.time(), evals=0, est=vs_est,
+                    tx_sel=[int(i) for i in dict.fromkeys(sel)],
+                    phase="init", round=0, grain=0, diri=0,
+                    jd=0, jpass=0, jimp=False,
+                    seeds=None, axes=np.tile([0.0, 0.0, 1.0], (vs_g, 1)),
+                    bJ=None, hist=[],
+                    lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
+                            J=None, Jac=None, col=0, trial=0),
+                    polish=False)
+                st.session_state.pop("vs_result", None)
+                st.rerun()
+
+            vjob = st.session_state.get("vs_job")
+            if vjob is not None and vjob["sig"] != _vs_sig:
+                del st.session_state.vs_job
+                js_progress(done=True)
+                st.warning("Configuration changed during the Voronoi-seed "
+                           "inversion; run aborted.")
+                vjob = None
+            if vjob is not None:
+                from ringfwi import voronoi_inv as vi
+                ds = st.session_state.ds
+                src_sub = [src_list[i] for i in vjob["tx_sel"]]
+                dobs_sub = ds.data[vjob["tx_sel"]]
+                vs_mask = labels >= 0
+                if vjob["seeds"] is None:
+                    vjob["seeds"] = vi.kmeans_seeds(vs_mask, h, vs_g,
+                                                    seed=int(seed))
+                if vjob["polish"]:
+                    lab_now = vi.hard_labels(vjob["seeds"], vs_mask, h)
+                    res_fn = cof.make_residual(
+                        lab_now, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
+                        material=material,
+                        filter_fn=lambda d: apply_rx_filter(d, axis=1))
+
+                    def vJ(params_flat):
+                        r_ = res_fn(np.asarray(params_flat))
+                        return 0.5 * float(r_ @ r_), r_
+                else:
+                    res_fn = vi.make_residual_seeds(
+                        vs_mask, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
+                        material=material,
+                        filter_fn=lambda d: apply_rx_filter(d, axis=1))
+
+                    def vJ(params_flat):
+                        r_ = res_fn(np.asarray(params_flat))
+                        return 0.5 * float(r_ @ r_), r_
+
+                frac = vjob["evals"] / max(vjob["est"], 1)
+                el = time.time() - vjob["t0"]
+                eta = el / max(vjob["evals"], 1) * max(vjob["est"] - vjob["evals"], 0)
+                msg = (f"Voronoi seeds [{vjob['phase']}"
+                       f" r{vjob['round'] + 1}/{vs_rounds}]: evaluation "
+                       f"{vjob['evals'] + 1}/~{vjob['est']}"
+                       + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
+                          if vjob["evals"] else " ..."))
+                js_progress(min(frac, 1.0), msg)
+                if not IN_BROWSER:
+                    st.progress(min(frac, 1.0), text=msg)
+
+                hemi = [d if d[2] >= 0 else -d
+                        for d in _fibonacci_directions(vs_dirs,
+                                                       hemisphere=True)]
+                _jmoves = [np.array(m, float) * 2 * h for m in
+                           [(1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                            (0, -1, 0), (0, 0, 1), (0, 0, -1)]]
+                done = False
+                if vjob["phase"] == "init":
+                    J0, _ = vJ(vi.params_pack(vjob["seeds"], vjob["axes"]))
+                    vjob["bJ"] = J0
+                    vjob["hist"].append(J0)
+                    vjob["phase"] = "angles"
+                elif vjob["phase"] == "angles":
+                    g_i, d_i = vjob["grain"], vjob["diri"]
+                    at = vjob["axes"].copy()
+                    at[g_i] = hemi[d_i]
+                    Jt, _ = vJ(vi.params_pack(vjob["seeds"], at))
+                    if Jt < vjob["bJ"]:
+                        vjob["bJ"] = Jt
+                        vjob["axes"] = at
+                        vjob["hist"].append(Jt)
+                    vjob["diri"] += 1
+                    if vjob["diri"] >= vs_dirs:
+                        vjob["diri"] = 0
+                        vjob["grain"] += 1
+                        if vjob["grain"] >= vs_g:
+                            vjob["grain"] = 0
+                            vjob["phase"] = "jitter"
+                            vjob["jd"] = 0; vjob["jpass"] = 0
+                            vjob["jimp"] = False
+                elif vjob["phase"] == "jitter":
+                    g_i, j_i = vjob["grain"], vjob["jd"]
+                    st_ = vjob["seeds"].copy()
+                    st_[g_i] = st_[g_i] + _jmoves[j_i]
+                    Jt, _ = vJ(vi.params_pack(st_, vjob["axes"]))
+                    if Jt < vjob["bJ"]:
+                        vjob["bJ"] = Jt
+                        vjob["seeds"] = st_
+                        vjob["jimp"] = True
+                        vjob["hist"].append(Jt)
+                    vjob["jd"] += 1
+                    if vjob["jd"] >= len(_jmoves):
+                        vjob["jd"] = 0
+                        vjob["grain"] += 1
+                        if vjob["grain"] >= vs_g:
+                            vjob["grain"] = 0
+                            vjob["jpass"] += 1
+                            if vjob["jimp"] and vjob["jpass"] < 2:
+                                vjob["jimp"] = False
+                            else:
+                                vjob["phase"] = "lm"
+                                vjob["lm"] = dict(
+                                    it=0, sub="base", lam=1e-2,
+                                    p=vi.params_pack(vjob["seeds"],
+                                                     vjob["axes"]),
+                                    r=None, J=None, Jac=None, col=0, trial=0)
+                                if vs_lm == 0:
+                                    vjob["lm"]["sub"] = "skip"
+                else:                                   # lm or polish
+                    lm = vjob["lm"]
+                    if vjob["polish"]:
+                        fdv = np.radians(2.0)
+                    else:
+                        fdv = vi.fd_steps(vs_g, h)
+
+                    def _finish_lm():
+                        if vjob["polish"]:
+                            vjob["axes"] = cof.axes_from_params(
+                                np.asarray(lm["p"]).reshape(-1, 2))
+                            return True                 # fully done
+                        vjob["seeds"], vjob["axes"] = vi.params_unpack(
+                            np.asarray(lm["p"]).ravel())
+                        vjob["bJ"] = lm["J"] if lm["J"] is not None \
+                            else vjob["bJ"]
+                        vjob["round"] += 1
+                        if vjob["round"] < vs_rounds:
+                            vjob["phase"] = "angles"
+                            vjob["grain"] = 0; vjob["diri"] = 0
+                        else:                           # angle-only polish
+                            vjob["polish"] = True
+                            vjob["phase"] = "lm"
+                            vjob["lm"] = dict(
+                                it=0, sub="base", lam=1e-2,
+                                p=cof.params_from_axes(vjob["axes"]).ravel(),
+                                r=None, J=None, Jac=None, col=0, trial=0)
+                        return False
+
+                    if lm["sub"] == "skip":
+                        done = _finish_lm()
+                    elif lm["sub"] == "base":
+                        lm["J"], lm["r"] = vJ(lm["p"])
+                        vjob["hist"].append(lm["J"])
+                        lm["Jac"] = np.empty((lm["r"].size, lm["p"].size))
+                        lm["sub"] = "col"; lm["col"] = 0
+                    elif lm["sub"] == "col":
+                        k = lm["col"]
+                        pk = np.asarray(lm["p"], float).copy()
+                        fk = fdv if np.ndim(fdv) == 0 else fdv[k]
+                        pk[k] += fk
+                        _, rk = vJ(pk)
+                        lm["Jac"][:, k] = (rk - lm["r"]) / fk
+                        lm["col"] += 1
+                        if lm["col"] >= np.asarray(lm["p"]).size:
+                            lm["sub"] = "trial"; lm["trial"] = 0
+                    else:                               # trial
+                        Jc = lm["Jac"]
+                        gv = Jc.T @ lm["r"]
+                        Hm = Jc.T @ Jc
+                        step = np.linalg.solve(
+                            Hm + lm["lam"] * np.diag(np.diag(Hm) + 1e-30),
+                            -gv)
+                        p_try = np.asarray(lm["p"]) + step
+                        J_try, _ = vJ(p_try)
+                        n_lm = 2 if vjob["polish"] else vs_lm
+                        if J_try < lm["J"]:
+                            lm["p"] = p_try
+                            lm["lam"] = max(lm["lam"] / 3.0, 1e-8)
+                            lm["it"] += 1
+                            lm["sub"] = "base"
+                            if lm["it"] >= n_lm:
+                                done = _finish_lm()
+                        else:
+                            lm["lam"] *= 5.0
+                            lm["trial"] += 1
+                            if lm["trial"] >= 5:
+                                done = _finish_lm()
+                vjob["evals"] += 1
+                if not done:
+                    st.rerun()
+                js_progress(done=True)
+                lab_f = vi.hard_labels(vjob["seeds"], vs_mask, h)
+                par_f = cof.params_from_axes(vjob["axes"])
+                colat_f = np.zeros(vs_mask.shape)
+                azim_f = np.zeros(vs_mask.shape)
+                for _k in range(vs_g):
+                    _m = lab_f == _k
+                    colat_f[_m] = par_f[_k, 0]
+                    azim_f[_m] = par_f[_k, 1]
+                true_ax_map = np.zeros(vs_mask.shape + (3,))
+                for _k in range(len(axes3)):
+                    true_ax_map[labels == _k] = axes3[_k]
+                errm = axisfield.axis_error_map(colat_f, azim_f,
+                                                true_ax_map, vs_mask)
+                st.session_state.vs_result = dict(
+                    labels=lab_f, axes=np.asarray(vjob["axes"]),
+                    colat_deg=np.degrees(par_f[:, 0]),
+                    err=np.where(vs_mask, errm, np.nan),
+                    mean_err=float(errm[vs_mask].mean()),
+                    max_err=float(errm[vs_mask].max()),
+                    hist=list(vjob["hist"]), evals=vjob["evals"],
+                    secs=time.time() - vjob["t0"])
+                del st.session_state.vs_job
+
+            vres = st.session_state.get("vs_result")
+            if vres is not None:
+                import plotly.graph_objects as go
+                st.success(f"Voronoi grains recovered (geometry + axes, no "
+                           f"prior) in {vres['evals']} evaluations "
+                           f"({hms(vres['secs'])}): mean axis error "
+                           f"{vres['mean_err']:.1f} deg, max "
+                           f"{vres['max_err']:.1f} deg")
+                colat_t3 = np.degrees(np.arccos(np.clip(
+                    np.abs(axes3[:, 2]), 0, 1)))
+                vca, vcb = st.columns(2)
+                with vca:
+                    st.plotly_chart(render3d.polycrystal_figure(
+                        labels, colat_t3, h, "True grains (colatitude)",
+                        vmin=0, vmax=90), width="stretch")
+                with vcb:
+                    st.plotly_chart(render3d.polycrystal_figure(
+                        vres["labels"], vres["colat_deg"], h,
+                        "Recovered grains (geometry + colatitude)",
+                        vmin=0, vmax=90), width="stretch")
+                mmv = np.arange(n) * h * 1e3
+                verr = np.nan_to_num(vres["err"], nan=-1e3)
+                zc, yc, xc = np.meshgrid(mmv, mmv, mmv, indexing="ij")
+                fe = go.Figure(go.Volume(
+                    x=xc.ravel(), y=yc.ravel(), z=zc.ravel(),
+                    value=verr.ravel(), isomin=5.0, isomax=45.0,
+                    opacity=0.15, surface_count=17, colorscale="Inferno",
+                    colorbar=dict(title="deg"),
+                    caps=dict(x_show=False, y_show=False, z_show=False)))
+                fe.add_trace(go.Scatter3d(
+                    x=elem_abs[:, 0] * 1e3, y=elem_abs[:, 1] * 1e3,
+                    z=elem_abs[:, 2] * 1e3, mode="markers",
+                    marker=dict(size=3, color="#00e5ff"),
+                    showlegend=False, hoverinfo="skip"))
+                fe.update_layout(title="Axis error (only regions above 5 deg "
+                                       "shown; empty box = perfect)",
+                                 height=430, margin=dict(l=0, r=0, t=40, b=0),
+                                 scene=dict(xaxis_title="x (mm)",
+                                            yaxis_title="y (mm)",
+                                            zaxis_title="z (mm)"))
+                st.plotly_chart(fe, width="stretch")
+                fv = go.Figure(go.Scatter(y=vres["hist"],
+                                          mode="lines+markers"))
+                fv.update_yaxes(type="log", title="misfit")
+                fv.update_layout(title="Voronoi-seed convergence (accepted "
+                                       "improvements)",
+                                 xaxis_title="accepted update", height=260,
+                                 margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fv, width="stretch")
