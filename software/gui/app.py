@@ -122,7 +122,7 @@ with tab_arr:
             st.caption("A single ring sits on the mid-plane; axial span does not apply.")
     with ca2:
         st.subheader("Grid & sampling")
-        n_grid = st.slider("Grid points per axis", 28, 72, 34, 2,
+        n_grid = st.slider("Grid points per axis", 28, 72, 28, 2,
                            help="Finer grid = more accurate but slower (cubic cost "
                                 "in 3D). Polycrystal runs use the GPU automatically "
                                 "above ~35 points when CuPy is available.")
@@ -1732,7 +1732,7 @@ with tab_fwi:
             vs1, vs2, vs3, vs4 = st.columns(4)
             with vs1:
                 vs_tx = st.slider("Transmits ", 2, len(src_list),
-                                  min(8, len(src_list)), key="vs_tx")
+                                  min(6, len(src_list)), key="vs_tx")
             with vs2:
                 vs_g = st.slider("Grains (seeds)", 2, 10, 6, key="vs_g",
                                  help="Number of Voronoi cells to invert. "
