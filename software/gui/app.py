@@ -42,7 +42,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "simulation"))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))
 
-from ringfwi import anisotropy, cof, elastic3d, fwi, imaging, phantom, render3d
+from ringfwi import anisotropy, axisfield, cof, elastic3d, fwi, imaging, phantom, render3d
 from ringfwi import transducer as td
 from ringfwi.dataset import ArrayGeometry, Dataset
 from ringfwi.geometry import CylinderArray, build_footprints, _fibonacci_directions
@@ -66,7 +66,7 @@ if getattr(_rw, "_loaded_mtime", None) not in (None, _lib_mtime):
                   if m == "ringfwi" or m.startswith("ringfwi.")]:
         del sys.modules[_name]
     import ringfwi as _rw
-    from ringfwi import anisotropy, cof, elastic3d, fwi, imaging, phantom, render3d
+    from ringfwi import anisotropy, axisfield, cof, elastic3d, fwi, imaging, phantom, render3d
     from ringfwi import transducer as td
     from ringfwi.dataset import ArrayGeometry, Dataset
     from ringfwi.geometry import CylinderArray, build_footprints, _fibonacci_directions
@@ -103,7 +103,7 @@ st.caption(f"3D cylindrical-array ultrasound acquisition and reconstruction, pur
 
 tab_arr, tab_exc, tab_smp, tab_acq, tab_img, tab_fwi = st.tabs(
     ["Array & Transducer", "Excitation & Filters", "Sample", "Acquisition",
-     "Imaging (TFM)", "Reconstruction (FWI)"])
+     "Imaging (TFM)", "Reconstruction"])
 
 
 # ---- Configuration widgets (first pass) ------------------------------------
@@ -1302,3 +1302,230 @@ with tab_fwi:
                                  xaxis_title="accepted update", height=260,
                                  margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fh, width="stretch")
+
+            st.divider()
+            st.subheader("Orientation-field inversion (unknown geometry)")
+            st.caption("No grain labels anywhere: every voxel carries its own "
+                       "c-axis (a function of velocity at every angle), and "
+                       "grains emerge as regions where the recovered field is "
+                       "constant. Global coarse search on regular pseudo-grain "
+                       "blocks, then exact-adjoint voxel descent with "
+                       "orientation-tensor smoothing. Experimental; the full "
+                       "3D elastic adjoint runs once per transmit per "
+                       "iteration, so keep the grid modest.")
+            of_mask = labels >= 0
+            uf1, uf2, uf3, uf4, uf5 = st.columns(5)
+            with uf1:
+                of_tx = st.slider("Transmits", 2, len(src_list),
+                                  min(4, len(src_list)), key="of_tx")
+            with uf2:
+                of_div = st.slider("Blocks per axis", 1, 3, 2, key="of_div",
+                                   help="Coarse pseudo-grain partition for the global "
+                                        "initial search; blocks need not match any "
+                                        "true grain.")
+            with uf3:
+                of_dirs = st.slider("Coarse directions", 6, 24, 12, key="of_dirs")
+            with uf4:
+                of_iters = st.slider("Voxel iterations", 0, 20, 6, key="of_iters")
+            with uf5:
+                of_sigma = st.slider("Smoothing (voxels)", 0.0, 3.0, 1.5, 0.5,
+                                     key="of_sigma",
+                                     help="Orientation-tensor (Q = a aT) smoothing of "
+                                          "the axis field each iteration; promotes "
+                                          "grain-like piecewise-constant fields.")
+            _blab, _nb = axisfield.block_partition(of_mask, of_div)
+            of_est = 1 + _nb * of_dirs + of_iters * of_tx
+            st.caption(f"About {_nb * of_dirs} coarse evaluations of {of_tx} "
+                       f"transmits, then {of_iters} adjoint iterations "
+                       f"({_nb} blocks, {int(of_mask.sum())} unknown voxels x 2 "
+                       f"angles).")
+
+            _of_sig = (n, nt, int(seed), of_tx, of_div, of_dirs, of_iters,
+                       float(of_sigma), tuple(src_list))
+            if st.button("Recover orientation field", type="primary",
+                         disabled="of_job" in st.session_state, key="of_btn"):
+                sel = np.linspace(0, len(src_list) - 1, of_tx).astype(int)
+                st.session_state.of_job = dict(
+                    sig=_of_sig, t0=time.time(), evals=0, est=of_est,
+                    tx_sel=[int(i) for i in dict.fromkeys(sel)],
+                    phase="init", blab=_blab, nb=_nb,
+                    baxes=np.tile([0.0, 0.0, 1.0], (_nb, 1)),
+                    best_j=None, best_a=None, blk=0, diri=0,
+                    colat=None, azim=None, it=0, txi=0, Jacc=0.0,
+                    gt=None, gp=None, hist=[])
+                st.session_state.pop("of_result", None)
+                st.rerun()
+
+            ojob = st.session_state.get("of_job")
+            if ojob is not None and ojob["sig"] != _of_sig:
+                del st.session_state.of_job
+                js_progress(done=True)
+                st.warning("Configuration changed during the orientation-field "
+                           "inversion; run aborted.")
+                ojob = None
+            if ojob is not None:
+                ds = st.session_state.ds
+                src_sub = [src_list[i] for i in ojob["tx_sel"]]
+                dobs_sub = ds.data[ojob["tx_sel"]]
+                base6 = anisotropy.ti_stiffness_6(**material)
+                K_bg = 1000.0 * 1480.0 ** 2
+                Cbg = {k: np.full((n, n, n),
+                                  K_bg if (int(k[1]) <= 3 and int(k[2]) <= 3)
+                                  else 0.0)
+                       for k in axisfield.KEYS21}
+                # per-trace normalisation, self-trace excluded (the COF misfit)
+                _trn = np.sqrt(np.sum(dobs_sub ** 2, axis=1)) + 1e-30
+                _wtr = np.ones_like(_trn)
+                for _i, _s in enumerate(src_sub):
+                    _wtr[_i, _s] = 0.0
+                tw_list = [(_wtr / _trn)[_i] for _i in range(len(src_sub))]
+
+                frac = ojob["evals"] / max(ojob["est"], 1)
+                el = time.time() - ojob["t0"]
+                eta = el / max(ojob["evals"], 1) * max(ojob["est"] - ojob["evals"], 0)
+                msg = (f"Orientation field [{ojob['phase']}]: evaluation "
+                       f"{ojob['evals'] + 1}/~{ojob['est']}"
+                       + (f" ({el:.0f}s elapsed, ~{eta:.0f}s remaining)"
+                          if ojob["evals"] else " ..."))
+                js_progress(min(frac, 1.0), msg)
+                if not IN_BROWSER:
+                    st.progress(min(frac, 1.0), text=msg)
+
+                done = False
+                if ojob["phase"] in ("init", "coarse"):
+                    residual = cof.make_residual(
+                        ojob["blab"], ring, h, dt, nt, wavelet, src_sub,
+                        dobs_sub, material=material,
+                        filter_fn=lambda d: apply_rx_filter(d, axis=1))
+
+                    def Jof(bax):
+                        r_ = residual(cof.params_from_axes(bax))
+                        return 0.5 * float(r_ @ r_)
+
+                    hemi = [d if d[2] >= 0 else -d
+                            for d in _fibonacci_directions(of_dirs,
+                                                           hemisphere=True)]
+                    if ojob["phase"] == "init":
+                        J0 = Jof(ojob["baxes"])
+                        ojob["hist"].append(J0)
+                        ojob["best_j"] = J0
+                        ojob["best_a"] = ojob["baxes"][0].copy()
+                        ojob["phase"] = "coarse"
+                    else:
+                        b_i, d_i = ojob["blk"], ojob["diri"]
+                        bax_try = ojob["baxes"].copy()
+                        bax_try[b_i] = hemi[d_i]
+                        Jt = Jof(bax_try)
+                        if Jt < ojob["best_j"]:
+                            ojob["best_j"] = Jt
+                            ojob["best_a"] = np.array(hemi[d_i])
+                        ojob["diri"] += 1
+                        if ojob["diri"] >= of_dirs:
+                            ojob["baxes"][b_i] = ojob["best_a"]
+                            ojob["hist"].append(ojob["best_j"])
+                            ojob["diri"] = 0
+                            ojob["blk"] += 1
+                            if ojob["blk"] >= ojob["nb"]:
+                                ojob["colat"], ojob["azim"] = \
+                                    axisfield.axes_to_field(
+                                        ojob["blab"], ojob["baxes"], of_mask)
+                                ojob["phase"] = "voxel"
+                                if of_iters == 0:
+                                    done = True
+                            else:
+                                ojob["best_j"] = ojob["hist"][-1]
+                                ojob["best_a"] = \
+                                    ojob["baxes"][ojob["blk"]].copy()
+                else:                                   # voxel descent, one tx
+                    i_tx = ojob["txi"]
+                    src_pts_1 = [[(ring.element_index(src_sub[i_tx]), 1.0)]]
+                    rec_grp = [([idx], [1.0]) for idx in ring.idx]
+                    J1, g_t, g_p = axisfield.misfit_and_gradient_axes(
+                        ojob["colat"], ojob["azim"], of_mask, base6, Cbg,
+                        1000.0, material["rho"], h, dt, nt, src_pts_1,
+                        wavelet_eff, rec_grp, dobs_sub[i_tx:i_tx + 1],
+                        trace_weights=tw_list[i_tx])
+                    ojob["Jacc"] += J1
+                    ojob["gt"] = g_t if ojob["gt"] is None else ojob["gt"] + g_t
+                    ojob["gp"] = g_p if ojob["gp"] is None else ojob["gp"] + g_p
+                    ojob["txi"] += 1
+                    if ojob["txi"] >= len(src_sub):
+                        ojob["hist"].append(ojob["Jacc"])
+                        ojob["colat"], ojob["azim"] = axisfield.gradient_step(
+                            ojob["colat"], ojob["azim"], of_mask,
+                            ojob["gt"], ojob["gp"], step_rad=0.3,
+                            smooth_sigma=of_sigma)
+                        ojob["txi"] = 0; ojob["Jacc"] = 0.0
+                        ojob["gt"] = None; ojob["gp"] = None
+                        ojob["it"] += 1
+                        if ojob["it"] >= of_iters:
+                            done = True
+                ojob["evals"] += 1
+                if not done:
+                    st.rerun()
+                js_progress(done=True)
+                true_ax_map = np.zeros(of_mask.shape + (3,))
+                for _k in range(len(axes3)):
+                    true_ax_map[labels == _k] = axes3[_k]
+                errm = axisfield.axis_error_map(ojob["colat"], ojob["azim"],
+                                                true_ax_map, of_mask)
+                colat_true_map = np.degrees(np.arccos(np.clip(
+                    np.abs(true_ax_map[..., 2]), 0.0, 1.0))) * of_mask
+                a_rec = axisfield.field_to_axes(ojob["colat"], ojob["azim"])
+                colat_rec_map = np.degrees(np.arccos(np.clip(
+                    np.abs(a_rec[..., 2]), 0.0, 1.0))) * of_mask
+                st.session_state.of_result = dict(
+                    colat_true=colat_true_map, colat_rec=colat_rec_map,
+                    err=errm, mean_err=float(errm[of_mask].mean()),
+                    max_err=float(errm[of_mask].max()),
+                    hist=list(ojob["hist"]), evals=ojob["evals"],
+                    secs=time.time() - ojob["t0"])
+                del st.session_state.of_job
+
+            ores = st.session_state.get("of_result")
+            if ores is not None:
+                import plotly.graph_objects as go
+                from plotly.subplots import make_subplots
+                st.success(f"Orientation field recovered with no geometry "
+                           f"prior in {ores['evals']} evaluations "
+                           f"({ores['secs']:.0f}s): mean axis error "
+                           f"{ores['mean_err']:.1f} deg, "
+                           f"max {ores['max_err']:.1f} deg")
+                mmv = np.arange(n) * h * 1e3
+
+                def of_slices(vol, title, cmax, scale):
+                    fig = make_subplots(
+                        rows=1, cols=3, horizontal_spacing=0.06,
+                        subplot_titles=["xy (mid z)", "xz (mid y)",
+                                        "yz (mid x)"])
+                    views = [vol[n // 2], vol[:, n // 2, :], vol[:, :, n // 2]]
+                    for col, sl in enumerate(views, start=1):
+                        fig.add_trace(go.Heatmap(
+                            z=sl, x=mmv, y=mmv, coloraxis="coloraxis",
+                            hovertemplate="%{x:.1f}, %{y:.1f} mm | "
+                                          "%{z:.0f} deg<extra></extra>"),
+                            1, col)
+                    fig.update_layout(
+                        title=title, height=300,
+                        margin=dict(l=10, r=10, t=60, b=10),
+                        coloraxis=dict(colorscale=scale, cmin=0, cmax=cmax,
+                                       colorbar=dict(title="deg")))
+                    return fig
+
+                st.plotly_chart(of_slices(ores["colat_true"],
+                                          "True c-axis colatitude", 90,
+                                          "Twilight"), width="stretch")
+                st.plotly_chart(of_slices(ores["colat_rec"],
+                                          "Recovered colatitude "
+                                          "(grains emerge, no labels given)",
+                                          90, "Twilight"), width="stretch")
+                st.plotly_chart(of_slices(ores["err"], "Axis error", 45,
+                                          "Inferno"), width="stretch")
+                fo = go.Figure(go.Scatter(y=ores["hist"],
+                                          mode="lines+markers"))
+                fo.update_yaxes(type="log", title="misfit")
+                fo.update_layout(title="Orientation-field convergence "
+                                       "(coarse then voxel stages)",
+                                 xaxis_title="accepted update", height=260,
+                                 margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fo, width="stretch")

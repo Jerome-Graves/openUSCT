@@ -68,6 +68,51 @@ def _move(f, src, dst):
     return f
 
 
+def _DbT(g, ax, inv_h):
+    """Exact transpose of :func:`_Db`."""
+    o = np.zeros_like(g)
+    hi = [slice(None)] * 3; lo = [slice(None)] * 3
+    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
+    q = g[tuple(hi)] * inv_h
+    o[tuple(hi)] += q
+    o[tuple(lo)] -= q
+    return o
+
+
+def _DfT(g, ax, inv_h):
+    """Exact transpose of :func:`_Df`."""
+    o = np.zeros_like(g)
+    hi = [slice(None)] * 3; lo = [slice(None)] * 3
+    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
+    q = g[tuple(lo)] * inv_h
+    o[tuple(hi)] += q
+    o[tuple(lo)] -= q
+    return o
+
+
+def _avg_axis_T(g, ax, d):
+    """Exact transpose of :func:`_avg_axis`."""
+    o = np.zeros_like(g)
+    hi = [slice(None)] * 3; lo = [slice(None)] * 3
+    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
+    q = 0.5 * (g[tuple(lo)] if d > 0 else g[tuple(hi)])
+    o[tuple(lo)] += q
+    o[tuple(hi)] += q
+    return o
+
+
+def _move_T(g, src, dst):
+    """Exact transpose of ``_move(., src, dst)`` (maps adjoints dst -> src)."""
+    for ax in (2, 1, 0):
+        d = _POS[dst][ax] - _POS[src][ax]
+        if d:
+            g = _avg_axis_T(g, ax, d)
+    return g
+
+
+GRAD_KEYS = tuple(f"C{i}{j}" for i in range(1, 7) for j in range(i, 7))
+
+
 def gpu_available():
     """True when CuPy and a CUDA device are usable."""
     try:
@@ -217,3 +262,201 @@ def forward(C, rho, h, dt, nt, src_idx, wavelet, rec_idx,
         import cupy as cp
         rec = cp.asnumpy(rec).astype(np.float64)
     return rec, hist
+
+
+# ---------------------------------------------------------------------------
+# Exact discrete adjoint: gradient of the data misfit with respect to all 21
+# stiffness maps, by reverse-mode differentiation of the forward above. The
+# same construction as the verified 2D full-stiffness adjoint in
+# ringfwi.anisotropy (see tests/test_gradient_elastic3d.py for the
+# finite-difference verification).
+# ---------------------------------------------------------------------------
+
+def _grad_forward(C, rho, h, dt, nt, src_idx, wavelet, rec_idx,
+                  src_pts=None, rec_groups=None):
+    """Explosive-source / pressure-record forward storing velocity history.
+
+    Identical physics to :func:`forward` (CPU float64 path) but keeps
+    vx/vy/vz at the start of every step -- the state the adjoint needs to
+    rebuild the strain rates in reverse.
+    """
+    rho = np.asarray(rho, float)
+    nz, ny, nx = rho.shape
+    inv_h = 1.0 / h
+
+    def cij(i, j):
+        return C[f"C{min(i, j)}{max(i, j)}"]
+
+    active = {(I, J): bool(np.any(cij(I, J))) for I in range(1, 7)
+              for J in range(1, 7)}
+    if src_pts is None:
+        src_pts = [(src_idx, 1.0)]
+    n_rx = len(rec_groups) if rec_groups is not None else len(rec_idx)
+
+    vx = np.zeros((nz, ny, nx)); vy = np.zeros((nz, ny, nx))
+    vz = np.zeros((nz, ny, nx))
+    s = {I: np.zeros((nz, ny, nx)) for I in range(1, 7)}
+    rec = np.zeros((nt, n_rx))
+    vh = np.zeros((nt, 3, nz, ny, nx))
+    Z, Y, X = _AX["z"], _AX["y"], _AX["x"]
+
+    for n in range(nt):
+        vh[n, 0] = vx; vh[n, 1] = vy; vh[n, 2] = vz
+        gam = {1: _Db(vx, X, inv_h), 2: _Db(vy, Y, inv_h), 3: _Db(vz, Z, inv_h),
+               4: _Df(vz, Y, inv_h) + _Df(vy, Z, inv_h),
+               5: _Df(vz, X, inv_h) + _Df(vx, Z, inv_h),
+               6: _Df(vy, X, inv_h) + _Df(vx, Y, inv_h)}
+        moved = {}
+
+        def strain_at(J, pos):
+            key = (J, pos)
+            if key not in moved:
+                moved[key] = (gam[J] if _VPOS[J] == pos
+                              else _move(gam[J], _VPOS[J], pos))
+            return moved[key]
+
+        for I in range(1, 7):
+            pos = _VPOS[I]
+            rate = None
+            for J in range(1, 7):
+                if not active[(I, J)]:
+                    continue
+                term = cij(I, J) * strain_at(J, pos)
+                rate = term if rate is None else rate + term
+            if rate is not None:
+                s[I] += dt * rate
+
+        for idx, w in src_pts:
+            for I in (1, 2, 3):
+                s[I][idx] += wavelet[n] * w
+
+        vx += (dt / rho) * (_Df(s[1], X, inv_h) + _Db(s[6], Y, inv_h) + _Db(s[5], Z, inv_h))
+        vy += (dt / rho) * (_Db(s[6], X, inv_h) + _Df(s[2], Y, inv_h) + _Db(s[4], Z, inv_h))
+        vz += (dt / rho) * (_Db(s[5], X, inv_h) + _Db(s[4], Y, inv_h) + _Df(s[3], Z, inv_h))
+
+        field = -(s[1] + s[2] + s[3]) / 3.0
+        if rec_groups is not None:
+            for j, (idxs, ws) in enumerate(rec_groups):
+                rec[n, j] = sum(wi * field[ix] for ix, wi in zip(idxs, ws))
+        else:
+            for j, idx in enumerate(rec_idx):
+                rec[n, j] = field[idx]
+    return rec, vh
+
+
+def misfit_and_gradient(C, rho, h, dt, nt, src_idx, wavelet, rec_idx, dobs,
+                        src_pts=None, rec_groups=None, trace_weights=None,
+                        grad_keys=None):
+    """Data misfit J and its gradient w.r.t. the 21 stiffness maps.
+
+    One explosive source recorded as pressure; J = 0.5 ||W (rec - dobs)||^2
+    with optional ``trace_weights`` W (broadcast against (nt, n_rx)).
+    Returns (J, {key: (nz, ny, nx) gradient}) for ``grad_keys`` (default: all
+    21 upper-triangle keys). Exact to the discrete forward, so gradients are
+    returned even for stiffnesses that are currently zero (the angle chain
+    rule needs them).
+    """
+    rho = np.asarray(rho, float)
+    nz, ny, nx = rho.shape
+    inv_h = 1.0 / h
+    if grad_keys is None:
+        grad_keys = GRAD_KEYS
+
+    def cij(i, j):
+        return C[f"C{min(i, j)}{max(i, j)}"]
+
+    active = {(I, J): bool(np.any(cij(I, J))) for I in range(1, 7)
+              for J in range(1, 7)}
+    rec, vh = _grad_forward(C, rho, h, dt, nt, src_idx, wavelet, rec_idx,
+                            src_pts=src_pts, rec_groups=rec_groups)
+    res = rec - dobs
+    if trace_weights is not None:
+        res = res * trace_weights
+    J = 0.5 * float(np.sum(res * res))
+    if trace_weights is not None:
+        res = res * trace_weights        # adjoint source: W^T W (rec - dobs)
+
+    lv = {a: np.zeros((nz, ny, nx)) for a in "xyz"}
+    ls = {I: np.zeros((nz, ny, nx)) for I in range(1, 7)}
+    g = {k: np.zeros((nz, ny, nx)) for k in grad_keys}
+    dtr = dt / rho
+    Z, Y, X = _AX["z"], _AX["y"], _AX["x"]
+
+    for n in range(nt - 1, -1, -1):
+        vx, vy, vz = vh[n, 0], vh[n, 1], vh[n, 2]
+        gam = {1: _Db(vx, X, inv_h), 2: _Db(vy, Y, inv_h), 3: _Db(vz, Z, inv_h),
+               4: _Df(vz, Y, inv_h) + _Df(vy, Z, inv_h),
+               5: _Df(vz, X, inv_h) + _Df(vx, Z, inv_h),
+               6: _Df(vy, X, inv_h) + _Df(vx, Y, inv_h)}
+        moved = {}
+
+        def strain_at(J, pos):
+            key = (J, pos)
+            if key not in moved:
+                moved[key] = (gam[J] if _VPOS[J] == pos
+                              else _move(gam[J], _VPOS[J], pos))
+            return moved[key]
+
+        # adjoint of the pressure recording
+        if rec_groups is not None:
+            for j, (idxs, ws) in enumerate(rec_groups):
+                for ix, wi in zip(idxs, ws):
+                    q = res[n, j] * wi / 3.0
+                    ls[1][ix] -= q; ls[2][ix] -= q; ls[3][ix] -= q
+        else:
+            for j, idx in enumerate(rec_idx):
+                q = res[n, j] / 3.0
+                ls[1][idx] -= q; ls[2][idx] -= q; ls[3][idx] -= q
+
+        # adjoint of the velocity update (deposits into the stress adjoints)
+        ls[1] += _DfT(dtr * lv["x"], X, inv_h)
+        ls[6] += _DbT(dtr * lv["x"], Y, inv_h) + _DbT(dtr * lv["y"], X, inv_h)
+        ls[5] += _DbT(dtr * lv["x"], Z, inv_h) + _DbT(dtr * lv["z"], X, inv_h)
+        ls[2] += _DfT(dtr * lv["y"], Y, inv_h)
+        ls[4] += _DbT(dtr * lv["y"], Z, inv_h) + _DbT(dtr * lv["z"], Y, inv_h)
+        ls[3] += _DfT(dtr * lv["z"], Z, inv_h)
+
+        # gradient accumulation from the stress update
+        for key in grad_keys:
+            i, j = int(key[1]), int(key[2])
+            if i == j:
+                g[key] += ls[i] * dt * gam[i]
+            else:
+                g[key] += (ls[i] * dt * strain_at(j, _VPOS[i])
+                           + ls[j] * dt * strain_at(i, _VPOS[j]))
+
+        # adjoint of the stress update (deposits into the velocity adjoints).
+        # w_J collects, at gamma_J's native position, the sensitivity routed
+        # through every active C_IJ coupling (transposed half-cell averaging).
+        w = {}
+        for Jv in range(1, 7):
+            acc = None
+            for p in ("c", "yz", "xz", "xy"):
+                tmp = None
+                for I in range(1, 7):
+                    if _VPOS[I] != p or not active[(I, Jv)]:
+                        continue
+                    term = dt * cij(I, Jv) * ls[I]
+                    tmp = term if tmp is None else tmp + term
+                if tmp is None:
+                    continue
+                if p != _VPOS[Jv]:
+                    tmp = _move_T(tmp, _VPOS[Jv], p)
+                acc = tmp if acc is None else acc + tmp
+            if acc is not None:
+                w[Jv] = acc
+
+        if 1 in w:
+            lv["x"] += _DbT(w[1], X, inv_h)
+        if 2 in w:
+            lv["y"] += _DbT(w[2], Y, inv_h)
+        if 3 in w:
+            lv["z"] += _DbT(w[3], Z, inv_h)
+        if 4 in w:
+            lv["z"] += _DfT(w[4], Y, inv_h); lv["y"] += _DfT(w[4], Z, inv_h)
+        if 5 in w:
+            lv["z"] += _DfT(w[5], X, inv_h); lv["x"] += _DfT(w[5], Z, inv_h)
+        if 6 in w:
+            lv["y"] += _DfT(w[6], X, inv_h); lv["x"] += _DfT(w[6], Y, inv_h)
+
+    return J, g
