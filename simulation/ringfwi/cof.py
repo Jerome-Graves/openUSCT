@@ -46,13 +46,9 @@ def fmc(labels, axes, ring, h, dt, nt, wavelet, src_list, material=None,
     to benefit; pass "cpu" for the float64 reference.
     """
     Cm, rho = _an.polycrystal_stiffness_3d(labels, axes, material=material)
-    data = np.zeros((len(src_list), nt, ring.n_elements))
-    for i, s in enumerate(src_list):
-        rec, _ = _e3d.forward(Cm, rho, h, dt, nt, ring.element_index(s),
-                              wavelet, ring.idx, source="explosive",
-                              record="pressure", device=device)
-        data[i] = rec
-    return data
+    src_pts_list = [[(ring.element_index(s), 1.0)] for s in src_list]
+    return _e3d.forward_batch(Cm, rho, h, dt, nt, src_pts_list, wavelet,
+                              rec_idx=ring.idx, device=device)
 
 
 def make_residual(labels, ring, h, dt, nt, wavelet, src_list, dobs,

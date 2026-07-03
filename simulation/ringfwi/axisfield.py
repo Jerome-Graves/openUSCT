@@ -273,14 +273,13 @@ def field_misfit(colat_map, azim_map, mask, base6, Cbg, rho_bg, rho_mat,
     """
     Cmaps, rho = build_maps(colat_map, azim_map, mask, base6, Cbg,
                             rho_bg, rho_mat)
+    recs = _e3d.forward_batch(Cmaps, rho, h, dt, nt, src_pts_list, wavelet,
+                              rec_groups=rec_groups, device=device)
     J = 0.0
-    for i_tx, src_pts in enumerate(src_pts_list):
+    for i_tx in range(len(src_pts_list)):
         tw = (trace_weights[i_tx] if isinstance(trace_weights, (list, tuple))
               else trace_weights)
-        rec, _ = _e3d.forward(Cmaps, rho, h, dt, nt, None, wavelet, None,
-                              src_pts=src_pts, rec_groups=rec_groups,
-                              device=device)
-        res = rec - dobs[i_tx]
+        res = recs[i_tx] - dobs[i_tx]
         if tw is not None:
             res = res * tw
         J += 0.5 * float(np.sum(res * res))

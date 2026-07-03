@@ -26,36 +26,40 @@ import numpy as np
 _POS = {"c": (0, 0, 0), "yz": (1, 1, 0), "xz": (1, 0, 1), "xy": (0, 1, 1)}
 # Voigt index -> position of that stress/strain component.
 _VPOS = {1: "c", 2: "c", 3: "c", 4: "yz", 5: "xz", 6: "xy"}
-_AX = {"z": 0, "y": 1, "x": 2}
+_AX = {"z": -3, "y": -2, "x": -1}
+
+
+def _sl(f, ax):
+    """(hi, lo) slicing tuples along ``ax`` for arrays with any lead axes."""
+    hi = [slice(None)] * f.ndim; lo = [slice(None)] * f.ndim
+    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
+    return tuple(hi), tuple(lo)
 
 
 def _Db(f, ax, inv_h):
     """Backward difference along ``ax`` (half -> integer position)."""
     g = np.zeros_like(f)
-    hi = [slice(None)] * 3; lo = [slice(None)] * 3
-    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
-    g[tuple(hi)] = (f[tuple(hi)] - f[tuple(lo)]) * inv_h
+    hi, lo = _sl(f, ax)
+    g[hi] = (f[hi] - f[lo]) * inv_h
     return g
 
 
 def _Df(f, ax, inv_h):
     """Forward difference along ``ax`` (integer -> half position)."""
     g = np.zeros_like(f)
-    hi = [slice(None)] * 3; lo = [slice(None)] * 3
-    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
-    g[tuple(lo)] = (f[tuple(hi)] - f[tuple(lo)]) * inv_h
+    hi, lo = _sl(f, ax)
+    g[lo] = (f[hi] - f[lo]) * inv_h
     return g
 
 
 def _avg_axis(f, ax, d):
     """Half-cell average along ``ax``: d=+1 integer->half, d=-1 half->integer."""
     g = np.zeros_like(f)
-    hi = [slice(None)] * 3; lo = [slice(None)] * 3
-    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
+    hi, lo = _sl(f, ax)
     if d > 0:
-        g[tuple(lo)] = 0.5 * (f[tuple(lo)] + f[tuple(hi)])
+        g[lo] = 0.5 * (f[lo] + f[hi])
     else:
-        g[tuple(hi)] = 0.5 * (f[tuple(lo)] + f[tuple(hi)])
+        g[hi] = 0.5 * (f[lo] + f[hi])
     return g
 
 
@@ -64,40 +68,37 @@ def _move(f, src, dst):
     for ax in range(3):
         d = _POS[dst][ax] - _POS[src][ax]
         if d:
-            f = _avg_axis(f, ax, d)
+            f = _avg_axis(f, ax - 3, d)     # last three axes (batch-safe)
     return f
 
 
 def _DbT(g, ax, inv_h):
     """Exact transpose of :func:`_Db`."""
     o = np.zeros_like(g)
-    hi = [slice(None)] * 3; lo = [slice(None)] * 3
-    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
-    q = g[tuple(hi)] * inv_h
-    o[tuple(hi)] += q
-    o[tuple(lo)] -= q
+    hi, lo = _sl(g, ax)
+    q = g[hi] * inv_h
+    o[hi] += q
+    o[lo] -= q
     return o
 
 
 def _DfT(g, ax, inv_h):
     """Exact transpose of :func:`_Df`."""
     o = np.zeros_like(g)
-    hi = [slice(None)] * 3; lo = [slice(None)] * 3
-    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
-    q = g[tuple(lo)] * inv_h
-    o[tuple(hi)] += q
-    o[tuple(lo)] -= q
+    hi, lo = _sl(g, ax)
+    q = g[lo] * inv_h
+    o[hi] += q
+    o[lo] -= q
     return o
 
 
 def _avg_axis_T(g, ax, d):
     """Exact transpose of :func:`_avg_axis`."""
     o = np.zeros_like(g)
-    hi = [slice(None)] * 3; lo = [slice(None)] * 3
-    hi[ax] = slice(1, None); lo[ax] = slice(0, -1)
-    q = 0.5 * (g[tuple(lo)] if d > 0 else g[tuple(hi)])
-    o[tuple(lo)] += q
-    o[tuple(hi)] += q
+    hi, lo = _sl(g, ax)
+    q = 0.5 * (g[lo] if d > 0 else g[hi])
+    o[lo] += q
+    o[hi] += q
     return o
 
 
@@ -106,7 +107,7 @@ def _move_T(g, src, dst):
     for ax in (2, 1, 0):
         d = _POS[dst][ax] - _POS[src][ax]
         if d:
-            g = _avg_axis_T(g, ax, d)
+            g = _avg_axis_T(g, ax - 3, d)   # last three axes (batch-safe)
     return g
 
 
@@ -460,3 +461,144 @@ def misfit_and_gradient(C, rho, h, dt, nt, src_idx, wavelet, rec_idx, dobs,
             lv["y"] += _DfT(w[6], X, inv_h); lv["x"] += _DfT(w[6], Y, inv_h)
 
     return J, g
+
+
+def forward_batch(C, rho, h, dt, nt, src_pts_list, wavelet, rec_idx=None,
+                  rec_groups=None, device="auto"):
+    """All transmits of an FMC in ONE batched array pass (explosive/pressure).
+
+    ``src_pts_list`` is a list over B transmits of element footprints
+    [(idx, w), ...]; returns (B, nt, n_rx) float64. Batching amortises the
+    per-op Python overhead of the step loop across transmits and lifts the
+    effective array size over the GPU threshold (B x cells), so the CuPy
+    path engages at grid sizes where a single transmit stays CPU-bound.
+    Physics per transmit is identical to :func:`forward` (the operators are
+    batch-transparent), so results match the sequential loop exactly on CPU.
+    """
+    B = len(src_pts_list)
+    rho_h = np.asarray(rho, float)
+    nz, ny, nx = rho_h.shape
+    inv_h = 1.0 / h
+
+    use_gpu = False
+    if device in ("auto", "gpu"):
+        big_enough = device == "gpu" or B * rho_h.size >= 40000
+        if gpu_available() and big_enough:
+            use_gpu = True
+        elif device == "gpu":
+            raise RuntimeError("device='gpu' requested but CuPy/CUDA unavailable")
+    if use_gpu:
+        import cupy as xp
+        dtype = xp.float32
+    elif device == "cpu-batch":              # batched math on CPU (tests)
+        xp = np
+        dtype = np.float64
+    else:
+        # A CPU batch is math-bound and beats nothing (measured 0.5x), so
+        # fall back to the sequential verified forward per transmit.
+        n_rx = (len(rec_groups) if rec_groups is not None else len(rec_idx))
+        rec = np.zeros((B, nt, n_rx))
+        for b, sp in enumerate(src_pts_list):
+            rec[b], _ = forward(C, rho, h, dt, nt, None, wavelet, rec_idx,
+                                src_pts=sp, rec_groups=rec_groups,
+                                device="cpu")
+        return rec
+
+    def cij_host(i, j):
+        return C[f"C{min(i, j)}{max(i, j)}"]
+
+    active = {(I, J): bool(np.any(cij_host(I, J))) for I in range(1, 7)
+              for J in range(1, 7)}
+    Cd = {k: (xp.asarray(v, dtype) if np.ndim(v) else float(v))
+          for k, v in C.items()}
+
+    def cij(i, j):
+        return Cd[f"C{min(i, j)}{max(i, j)}"]
+
+    rho_d = xp.asarray(rho_h, dtype)
+
+    def _lin(t):
+        return (t[0] * ny + t[1]) * nx + t[2]
+
+    if rec_groups is not None:
+        kmax = max(len(idxs) for idxs, _ in rec_groups)
+        idx_mat = np.zeros((len(rec_groups), kmax), dtype=np.int64)
+        w_mat = np.zeros((len(rec_groups), kmax))
+        for j, (idxs, ws) in enumerate(rec_groups):
+            for k_, (ix, wi) in enumerate(zip(idxs, ws)):
+                idx_mat[j, k_] = _lin(ix)
+                w_mat[j, k_] = wi
+        idx_mat = xp.asarray(idx_mat)
+        w_mat = xp.asarray(w_mat, dtype)
+        n_rx = len(rec_groups)
+    else:
+        rec_lin = xp.asarray(np.array([_lin(t) for t in rec_idx],
+                                      dtype=np.int64))
+        n_rx = len(rec_idx)
+
+    # per-transmit source injection as flat scatter indices
+    src_flat = []
+    for b, pts in enumerate(src_pts_list):
+        for idx, wgt in pts:
+            src_flat.append((b * nz * ny * nx + _lin(idx), float(wgt)))
+    src_idx_d = xp.asarray(np.array([i for i, _ in src_flat],
+                                    dtype=np.int64))
+    src_w_d = xp.asarray(np.array([w for _, w in src_flat]), dtype)
+
+    vx = xp.zeros((B, nz, ny, nx), dtype)
+    vy = xp.zeros((B, nz, ny, nx), dtype)
+    vz = xp.zeros((B, nz, ny, nx), dtype)
+    s = {I: xp.zeros((B, nz, ny, nx), dtype) for I in range(1, 7)}
+    rec = xp.zeros((B, nt, n_rx), dtype)
+    Z, Y, X = _AX["z"], _AX["y"], _AX["x"]
+
+    for n in range(nt):
+        gam = {1: _Db(vx, X, inv_h), 2: _Db(vy, Y, inv_h),
+               3: _Db(vz, Z, inv_h),
+               4: _Df(vz, Y, inv_h) + _Df(vy, Z, inv_h),
+               5: _Df(vz, X, inv_h) + _Df(vx, Z, inv_h),
+               6: _Df(vy, X, inv_h) + _Df(vx, Y, inv_h)}
+        moved = {}
+
+        def strain_at(J, pos):
+            key = (J, pos)
+            if key not in moved:
+                moved[key] = (gam[J] if _VPOS[J] == pos
+                              else _move(gam[J], _VPOS[J], pos))
+            return moved[key]
+
+        for I in range(1, 7):
+            pos = _VPOS[I]
+            rate = None
+            for J in range(1, 7):
+                if not active[(I, J)]:
+                    continue
+                term = cij(I, J) * strain_at(J, pos)
+                rate = term if rate is None else rate + term
+            if rate is not None:
+                s[I] += dt * rate
+
+        wn = wavelet[n]
+        for I in (1, 2, 3):
+            flat = s[I].ravel()
+            flat[src_idx_d] += wn * src_w_d
+        # (ravel is a view; the scatter lands in s[I])
+
+        vx += (dt / rho_d) * (_Df(s[1], X, inv_h) + _Db(s[6], Y, inv_h)
+                              + _Db(s[5], Z, inv_h))
+        vy += (dt / rho_d) * (_Db(s[6], X, inv_h) + _Df(s[2], Y, inv_h)
+                              + _Db(s[4], Z, inv_h))
+        vz += (dt / rho_d) * (_Db(s[5], X, inv_h) + _Db(s[4], Y, inv_h)
+                              + _Df(s[3], Z, inv_h))
+
+        field = -(s[1] + s[2] + s[3]) / 3.0
+        flat = field.reshape(B, -1)
+        if rec_groups is not None:
+            rec[:, n, :] = (flat[:, idx_mat] * w_mat).sum(axis=-1)
+        else:
+            rec[:, n, :] = flat[:, rec_lin]
+
+    if use_gpu:
+        import cupy as cp
+        rec = cp.asnumpy(rec).astype(np.float64)
+    return rec
