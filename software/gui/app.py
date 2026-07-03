@@ -813,6 +813,8 @@ with tab_acq:
                 else:
                     gpu_data = webgpu_elastic.result(job["wgpu_id"], total,
                                                      nt, n_elem)
+                    js_progress(0.95, "GPU done; verifying one transmit on "
+                                      "the CPU (parity check) ...")
                     ref, _ = elastic3d.forward(
                         Cmaps3, rho_map3, h, dt, nt,
                         ring.element_index(src_list[0]), wavelet, ring.idx,
@@ -1860,6 +1862,9 @@ with tab_fwi:
                                                    nt, len(ring.idx))
                         _rg = _v_res_from_traces(_d)
                         if not vjob.get("wgpu_checked"):
+                            js_progress(0.05, "First GPU evaluation done; "
+                                              "verifying against the CPU "
+                                              "(one-off parity check) ...")
                             _pp = np.frombuffer(_pend["key"], dtype=float)
                             _rc = res_fn(_pp)
                             _rel = (np.max(np.abs(_rg - _rc))
