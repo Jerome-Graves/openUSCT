@@ -231,15 +231,22 @@ def gradient_step(colat_map, azim_map, mask, g_t, g_p, step_rad=0.1,
                   smooth_sigma=0.0):
     """Normalised steepest-descent update of the axis field.
 
-    Both angle maps move together under one normalisation (so azimuth, whose
-    sensitivity vanishes near the poles, is not artificially inflated), then
-    the field is orientation-tensor smoothed when ``smooth_sigma`` > 0.
+    ``smooth_sigma`` > 0 Gaussian-smooths the GRADIENT (mask-normalised)
+    before the step -- the regularisation that worked for the 2D theta-field
+    FWI. Smoothing the field itself after each step fights the data term
+    (measured: the misfit rises); keep :func:`smooth_axes` for one-off field
+    polishing only. Both angle maps move under one shared normalisation (so
+    azimuth, whose sensitivity vanishes near the poles, is not artificially
+    inflated).
     """
+    if smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        w = gaussian_filter(mask.astype(float), smooth_sigma) + 1e-12
+        g_t = gaussian_filter(g_t * mask, smooth_sigma) / w * mask
+        g_p = gaussian_filter(g_p * mask, smooth_sigma) / w * mask
     gmax = max(np.max(np.abs(g_t[mask])), np.max(np.abs(g_p[mask]))) + 1e-30
     colat = colat_map - step_rad * (g_t / gmax) * mask
     azim = azim_map - step_rad * (g_p / gmax) * mask
-    if smooth_sigma > 0:
-        colat, azim = smooth_axes(colat, azim, mask, smooth_sigma)
     return colat, azim
 
 

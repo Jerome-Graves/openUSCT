@@ -1330,9 +1330,11 @@ with tab_fwi:
             with uf5:
                 of_sigma = st.slider("Smoothing (voxels)", 0.0, 3.0, 1.5, 0.5,
                                      key="of_sigma",
-                                     help="Orientation-tensor (Q = a aT) smoothing of "
-                                          "the axis field each iteration; promotes "
-                                          "grain-like piecewise-constant fields.")
+                                     help="Gaussian smoothing of the orientation "
+                                          "gradient each iteration (the 2D "
+                                          "theta-field regularisation); uphill "
+                                          "iterations are rejected and the step "
+                                          "halved.")
             _blab, _nb = axisfield.block_partition(of_mask, of_div)
             of_est = 1 + _nb * of_dirs + of_iters * of_tx
             st.caption(f"About {_nb * of_dirs} coarse evaluations of {of_tx} "
@@ -1352,7 +1354,8 @@ with tab_fwi:
                     baxes=np.tile([0.0, 0.0, 1.0], (_nb, 1)),
                     best_j=None, best_a=None, blk=0, diri=0,
                     colat=None, azim=None, it=0, txi=0, Jacc=0.0,
-                    gt=None, gp=None, hist=[])
+                    gt=None, gp=None, hist=[], srate=0.3,
+                    bJ=None, bcolat=None, bazim=None, bgt=None, bgp=None)
                 st.session_state.pop("of_result", None)
                 st.rerun()
 
@@ -1451,9 +1454,21 @@ with tab_fwi:
                     ojob["txi"] += 1
                     if ojob["txi"] >= len(src_sub):
                         ojob["hist"].append(ojob["Jacc"])
+                        # monotone guard: an uphill iteration is rejected --
+                        # revert to the best field and halve the step.
+                        if ojob["bJ"] is None or ojob["Jacc"] < ojob["bJ"]:
+                            ojob["bJ"] = ojob["Jacc"]
+                            ojob["bcolat"] = ojob["colat"].copy()
+                            ojob["bazim"] = ojob["azim"].copy()
+                            ojob["bgt"], ojob["bgp"] = ojob["gt"], ojob["gp"]
+                        else:
+                            ojob["srate"] *= 0.5
+                            ojob["colat"] = ojob["bcolat"].copy()
+                            ojob["azim"] = ojob["bazim"].copy()
+                            ojob["gt"], ojob["gp"] = ojob["bgt"], ojob["bgp"]
                         ojob["colat"], ojob["azim"] = axisfield.gradient_step(
                             ojob["colat"], ojob["azim"], of_mask,
-                            ojob["gt"], ojob["gp"], step_rad=0.3,
+                            ojob["gt"], ojob["gp"], step_rad=ojob["srate"],
                             smooth_sigma=of_sigma)
                         ojob["txi"] = 0; ojob["Jacc"] = 0.0
                         ojob["gt"] = None; ojob["gp"] = None
@@ -1464,20 +1479,27 @@ with tab_fwi:
                 if not done:
                     st.rerun()
                 js_progress(done=True)
+                # best evaluated iterate (the final step is never evaluated)
+                fin_colat = (ojob["bcolat"] if ojob["bcolat"] is not None
+                             else ojob["colat"])
+                fin_azim = (ojob["bazim"] if ojob["bazim"] is not None
+                            else ojob["azim"])
                 true_ax_map = np.zeros(of_mask.shape + (3,))
                 for _k in range(len(axes3)):
                     true_ax_map[labels == _k] = axes3[_k]
-                errm = axisfield.axis_error_map(ojob["colat"], ojob["azim"],
+                errm = axisfield.axis_error_map(fin_colat, fin_azim,
                                                 true_ax_map, of_mask)
-                colat_true_map = np.degrees(np.arccos(np.clip(
-                    np.abs(true_ax_map[..., 2]), 0.0, 1.0))) * of_mask
-                a_rec = axisfield.field_to_axes(ojob["colat"], ojob["azim"])
-                colat_rec_map = np.degrees(np.arccos(np.clip(
-                    np.abs(a_rec[..., 2]), 0.0, 1.0))) * of_mask
+                mean_e = float(errm[of_mask].mean())
+                max_e = float(errm[of_mask].max())
+                _nanout = lambda v: np.where(of_mask, v, np.nan)
+                colat_true_map = _nanout(np.degrees(np.arccos(np.clip(
+                    np.abs(true_ax_map[..., 2]), 0.0, 1.0))))
+                a_rec = axisfield.field_to_axes(fin_colat, fin_azim)
+                colat_rec_map = _nanout(np.degrees(np.arccos(np.clip(
+                    np.abs(a_rec[..., 2]), 0.0, 1.0))))
                 st.session_state.of_result = dict(
                     colat_true=colat_true_map, colat_rec=colat_rec_map,
-                    err=errm, mean_err=float(errm[of_mask].mean()),
-                    max_err=float(errm[of_mask].max()),
+                    err=_nanout(errm), mean_err=mean_e, max_err=max_e,
                     hist=list(ojob["hist"]), evals=ojob["evals"],
                     secs=time.time() - ojob["t0"])
                 del st.session_state.of_job
