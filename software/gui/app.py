@@ -1314,17 +1314,19 @@ with tab_fwi:
                        "3D elastic adjoint runs once per transmit per "
                        "iteration, so keep the grid modest.")
             of_mask = labels >= 0
-            uf1, uf2, uf3, uf4, uf5 = st.columns(5)
+            uf1, uf2, uf3, uf4, uf5, uf6 = st.columns(6)
             with uf1:
                 of_tx = st.slider("Transmits", 2, len(src_list),
                                   min(4, len(src_list)), key="of_tx")
             with uf2:
-                of_div = st.slider("Blocks per axis", 1, 3, 2, key="of_div",
+                of_div = st.slider("Blocks per axis", 1, 3, 3, key="of_div",
                                    help="Coarse pseudo-grain partition for the global "
                                         "initial search; blocks need not match any "
-                                        "true grain.")
+                                        "true grain. Smaller blocks straddle fewer "
+                                        "grains, so more of the volume starts inside "
+                                        "the local convergence basin.")
             with uf3:
-                of_dirs = st.slider("Coarse directions", 6, 24, 12, key="of_dirs")
+                of_dirs = st.slider("Coarse directions", 6, 24, 16, key="of_dirs")
             with uf4:
                 of_iters = st.slider("Voxel iterations", 0, 20, 6, key="of_iters")
             with uf5:
@@ -1335,15 +1337,27 @@ with tab_fwi:
                                           "theta-field regularisation); uphill "
                                           "iterations are rejected and the step "
                                           "halved.")
+            with uf6:
+                of_seg = st.slider("Re-search segments", 0, 12, 8, key="of_seg",
+                                   help="After voxel descent, cluster the field "
+                                        "into emergent grains and globally "
+                                        "re-search the largest ones -- the escape "
+                                        "hatch for regions stranded in the wrong "
+                                        "basin. 0 disables the stage.")
             _blab, _nb = axisfield.block_partition(of_mask, of_div)
             of_est = 1 + _nb * of_dirs + of_iters * of_tx
+            if of_seg > 0:
+                of_est += 1 + of_seg * of_dirs + of_iters * of_tx
             st.caption(f"About {_nb * of_dirs} coarse evaluations of {of_tx} "
-                       f"transmits, then {of_iters} adjoint iterations "
-                       f"({_nb} blocks, {int(of_mask.sum())} unknown voxels x 2 "
-                       f"angles).")
+                       f"transmits, {of_iters} adjoint iterations "
+                       + (f", then up to {of_seg} segments x {of_dirs} "
+                          f"directions re-searched and {of_iters} more "
+                          f"iterations " if of_seg > 0 else "")
+                       + f"({_nb} blocks, {int(of_mask.sum())} unknown voxels "
+                         f"x 2 angles).")
 
             _of_sig = (n, nt, int(seed), of_tx, of_div, of_dirs, of_iters,
-                       float(of_sigma), tuple(src_list))
+                       float(of_sigma), int(of_seg), tuple(src_list))
             if st.button("Recover orientation field", type="primary",
                          disabled="of_job" in st.session_state, key="of_btn"):
                 sel = np.linspace(0, len(src_list) - 1, of_tx).astype(int)
@@ -1355,7 +1369,9 @@ with tab_fwi:
                     best_j=None, best_a=None, blk=0, diri=0,
                     colat=None, azim=None, it=0, txi=0, Jacc=0.0,
                     gt=None, gp=None, hist=[], srate=0.3,
-                    bJ=None, bcolat=None, bazim=None, bgt=None, bgp=None)
+                    bJ=None, bcolat=None, bazim=None, bgt=None, bgp=None,
+                    seg=None, seg_ids=None, seg_i=0, seg_d=0,
+                    sbj=None, sbd=None, round2=False)
                 st.session_state.pop("of_result", None)
                 st.rerun()
 
@@ -1394,6 +1410,30 @@ with tab_fwi:
                 if not IN_BROWSER:
                     st.progress(min(frac, 1.0), text=msg)
 
+                hemi = [d if d[2] >= 0 else -d
+                        for d in _fibonacci_directions(of_dirs,
+                                                       hemisphere=True)]
+                rec_grp_all = [([idx], [1.0]) for idx in ring.idx]
+                src_pts_all = [[(ring.element_index(s), 1.0)]
+                               for s in src_sub]
+
+                def _field_J(cl, az):
+                    return axisfield.field_misfit(
+                        cl, az, of_mask, base6, Cbg, 1000.0, material["rho"],
+                        h, dt, nt, src_pts_all, wavelet_eff, rec_grp_all,
+                        dobs_sub, trace_weights=tw_list, device="auto")
+
+                def _enter_second_descent():
+                    ojob["round2"] = True
+                    ojob["colat"] = ojob["bcolat"].copy()
+                    ojob["azim"] = ojob["bazim"].copy()
+                    ojob["bJ"] = None       # fresh guard, field is the best
+                    ojob["bgt"] = ojob["bgp"] = None
+                    ojob["it"] = 0
+                    ojob["srate"] = 0.3
+                    ojob["phase"] = "voxel"
+                    return of_iters == 0    # nothing left to run
+
                 done = False
                 if ojob["phase"] in ("init", "coarse"):
                     residual = cof.make_residual(
@@ -1405,9 +1445,6 @@ with tab_fwi:
                         r_ = residual(cof.params_from_axes(bax))
                         return 0.5 * float(r_ @ r_)
 
-                    hemi = [d if d[2] >= 0 else -d
-                            for d in _fibonacci_directions(of_dirs,
-                                                           hemisphere=True)]
                     if ojob["phase"] == "init":
                         J0 = Jof(ojob["baxes"])
                         ojob["hist"].append(J0)
@@ -1434,11 +1471,56 @@ with tab_fwi:
                                         ojob["blab"], ojob["baxes"], of_mask)
                                 ojob["phase"] = "voxel"
                                 if of_iters == 0:
-                                    done = True
+                                    if of_seg > 0:
+                                        ojob["phase"] = "segment"
+                                    else:
+                                        done = True
                             else:
                                 ojob["best_j"] = ojob["hist"][-1]
                                 ojob["best_a"] = \
                                     ojob["baxes"][ojob["blk"]].copy()
+                elif ojob["phase"] == "segment":
+                    # cluster the current best field into emergent grains
+                    if ojob["bcolat"] is None:      # straight from coarse
+                        ojob["bcolat"] = ojob["colat"].copy()
+                        ojob["bazim"] = ojob["azim"].copy()
+                    if ojob["bJ"] is None:
+                        ojob["bJ"] = _field_J(ojob["bcolat"], ojob["bazim"])
+                    seg, sizes, order = axisfield.segment_field(
+                        ojob["bcolat"], ojob["bazim"], of_mask, n_clusters=8)
+                    ojob["seg"] = seg
+                    ojob["seg_ids"] = [i for i in order
+                                       if sizes[i] >= 8][:of_seg]
+                    ojob["seg_i"] = 0; ojob["seg_d"] = 0
+                    ojob["sbj"] = ojob["bJ"]; ojob["sbd"] = None
+                    if ojob["seg_ids"]:
+                        ojob["phase"] = "research"
+                    else:
+                        done = _enter_second_descent()
+                elif ojob["phase"] == "research":
+                    # global hemisphere re-search of one segment, greedy
+                    sid = ojob["seg_ids"][ojob["seg_i"]]
+                    d = hemi[ojob["seg_d"]]
+                    c_t, a_t = axisfield.set_segment_axis(
+                        ojob["bcolat"], ojob["bazim"], ojob["seg"], sid, d)
+                    Jt = _field_J(c_t, a_t)
+                    if Jt < ojob["sbj"] * (1 - 1e-3):
+                        ojob["sbj"] = Jt
+                        ojob["sbd"] = np.array(d)
+                    ojob["seg_d"] += 1
+                    if ojob["seg_d"] >= of_dirs:
+                        if ojob["sbd"] is not None:     # segment improved
+                            ojob["bcolat"], ojob["bazim"] = \
+                                axisfield.set_segment_axis(
+                                    ojob["bcolat"], ojob["bazim"],
+                                    ojob["seg"], sid, ojob["sbd"])
+                            ojob["bJ"] = ojob["sbj"]
+                            ojob["hist"].append(ojob["bJ"])
+                        ojob["seg_d"] = 0; ojob["sbd"] = None
+                        ojob["seg_i"] += 1
+                        ojob["sbj"] = ojob["bJ"]
+                        if ojob["seg_i"] >= len(ojob["seg_ids"]):
+                            done = _enter_second_descent()
                 else:                                   # voxel descent, one tx
                     i_tx = ojob["txi"]
                     src_pts_1 = [[(ring.element_index(src_sub[i_tx]), 1.0)]]
@@ -1474,7 +1556,10 @@ with tab_fwi:
                         ojob["gt"] = None; ojob["gp"] = None
                         ojob["it"] += 1
                         if ojob["it"] >= of_iters:
-                            done = True
+                            if of_seg > 0 and not ojob["round2"]:
+                                ojob["phase"] = "segment"
+                            else:
+                                done = True
                 ojob["evals"] += 1
                 if not done:
                     st.rerun()
@@ -1515,34 +1600,48 @@ with tab_fwi:
                            f"max {ores['max_err']:.1f} deg")
                 mmv = np.arange(n) * h * 1e3
 
-                def of_slices(vol, title, cmax, scale):
-                    fig = make_subplots(
-                        rows=1, cols=3, horizontal_spacing=0.06,
-                        subplot_titles=["xy (mid z)", "xz (mid y)",
-                                        "yz (mid x)"])
-                    views = [vol[n // 2], vol[:, n // 2, :], vol[:, :, n // 2]]
-                    for col, sl in enumerate(views, start=1):
-                        fig.add_trace(go.Heatmap(
-                            z=sl, x=mmv, y=mmv, coloraxis="coloraxis",
-                            hovertemplate="%{x:.1f}, %{y:.1f} mm | "
-                                          "%{z:.0f} deg<extra></extra>"),
-                            1, col)
+                def of_volume(vol, title, cmax, scale, isomin=0.0, op=0.12):
+                    # exterior NaN -> far below isomin, so it renders as void
+                    v = np.nan_to_num(vol, nan=-1e3)
+                    zc, yc, xc = np.meshgrid(mmv, mmv, mmv, indexing="ij")
+                    fig = go.Figure(go.Volume(
+                        x=xc.ravel(), y=yc.ravel(), z=zc.ravel(),
+                        value=v.ravel(), isomin=isomin, isomax=cmax,
+                        opacity=op, surface_count=17, colorscale=scale,
+                        colorbar=dict(title="deg"),
+                        caps=dict(x_show=False, y_show=False, z_show=False)))
+                    fig.add_trace(go.Scatter3d(
+                        x=elem_abs[:, 0] * 1e3, y=elem_abs[:, 1] * 1e3,
+                        z=elem_abs[:, 2] * 1e3, mode="markers",
+                        marker=dict(size=3, color="#00e5ff"),
+                        showlegend=False, hoverinfo="skip"))
                     fig.update_layout(
-                        title=title, height=300,
-                        margin=dict(l=10, r=10, t=60, b=10),
-                        coloraxis=dict(colorscale=scale, cmin=0, cmax=cmax,
-                                       colorbar=dict(title="deg")))
+                        title=title, height=430,
+                        margin=dict(l=0, r=0, t=40, b=0),
+                        scene=dict(xaxis_title="x (mm)", yaxis_title="y (mm)",
+                                   zaxis_title="z (mm)"))
                     return fig
 
-                st.plotly_chart(of_slices(ores["colat_true"],
-                                          "True c-axis colatitude", 90,
-                                          "Twilight"), width="stretch")
-                st.plotly_chart(of_slices(ores["colat_rec"],
-                                          "Recovered colatitude "
-                                          "(grains emerge, no labels given)",
-                                          90, "Twilight"), width="stretch")
-                st.plotly_chart(of_slices(ores["err"], "Axis error", 45,
-                                          "Inferno"), width="stretch")
+                ofa, ofb = st.columns(2)
+                with ofa:
+                    st.plotly_chart(of_volume(ores["colat_true"],
+                                              "True c-axis colatitude", 90,
+                                              "Twilight"), width="stretch")
+                with ofb:
+                    st.plotly_chart(of_volume(ores["colat_rec"],
+                                              "Recovered colatitude (grains "
+                                              "emerge, no labels given)", 90,
+                                              "Twilight"), width="stretch")
+                st.plotly_chart(of_volume(ores["err"],
+                                          "Axis error (only regions above "
+                                          "5 deg shown)", 45, "Inferno",
+                                          isomin=5.0, op=0.15),
+                                width="stretch")
+                st.caption("Rotate and zoom; colour follows colatitude / "
+                           "error, the couplant is invisible. The error "
+                           "volume shows only where the recovered axis is "
+                           "more than 5 deg wrong, so a correct inversion "
+                           "is an empty box.")
                 fo = go.Figure(go.Scatter(y=ores["hist"],
                                           mode="lines+markers"))
                 fo.update_yaxes(type="log", title="misfit")
