@@ -924,6 +924,9 @@ with tab_acq:
             st.success(f"Acquired {data.shape[0]} transmits x {data.shape[1]} samples "
                        f"x {data.shape[2]} channels"
                        + (" | RX band-pass applied" if rx_filt_on else ""))
+            # the tab bar was built before the dataset existed; rerun once so
+            # the imaging/reconstruction tabs appear
+            st.rerun()
 
     if "ds" in st.session_state:
         ds = st.session_state.ds
