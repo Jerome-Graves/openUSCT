@@ -110,7 +110,7 @@ _acquired = "ds" in st.session_state
 _poly_pre = str(st.session_state.get("sample_type", "")).startswith("Voronoi")
 _tab_names = ["Array & Transducer", "Excitation & Filters", "Sample",
               ("Acquisition \u2705" if _acquired
-               else "\U0001F534 Acquisition \u2190 START HERE")]
+               else "**Acquisition**")]
 if _acquired:
     _tab_names.append("Imaging (TFM)")
     _tab_names.append("Velocity FWI")
