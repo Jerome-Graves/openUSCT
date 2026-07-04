@@ -102,9 +102,32 @@ st.markdown(
     "</div>", unsafe_allow_html=True)
 st.caption(f"3D cylindrical-array ultrasound acquisition and reconstruction, pure Python. Backend: {BACKEND_NAME}.")
 
-tab_arr, tab_exc, tab_smp, tab_acq, tab_img, tab_fwi = st.tabs(
-    ["Array & Transducer", "Excitation & Filters", "Sample", "Acquisition",
-     "Imaging (TFM)", "Reconstruction"])
+# Workflow-gated tabs: imaging/reconstruction only exist once an acquisition
+# has produced data, and the reconstruction methods offered depend on the
+# sample type (peeked from session state; identical to the radio's value on
+# this rerun since the widget is keyed).
+_acquired = "ds" in st.session_state
+_poly_pre = str(st.session_state.get("sample_type", "")).startswith("Voronoi")
+_tab_names = ["Array & Transducer", "Excitation & Filters", "Sample",
+              ("Acquisition \u2705" if _acquired
+               else "\U0001F534 Acquisition \u2190 START HERE")]
+if _acquired:
+    _tab_names.append("Imaging (TFM)")
+    _tab_names.append("Velocity FWI")
+    if _poly_pre:
+        _tab_names += ["COF (known grains)", "Orientation field",
+                       "Voronoi grains"]
+else:
+    st.info("Set up the array, excitation and sample, then run the "
+            "ACQUISITION tab \u2014 the imaging and reconstruction tabs "
+            "unlock once data exists.")
+_tabs = st.tabs(_tab_names)
+tab_arr, tab_exc, tab_smp, tab_acq = _tabs[0], _tabs[1], _tabs[2], _tabs[3]
+tab_img = _tabs[4] if _acquired else None
+tab_fwi = _tabs[5] if _acquired else None
+tab_cof = _tabs[6] if (_acquired and _poly_pre) else None
+tab_of = _tabs[7] if (_acquired and _poly_pre) else None
+tab_vs = _tabs[8] if (_acquired and _poly_pre) else None
 
 
 # ---- Configuration widgets (first pass) ------------------------------------
@@ -190,7 +213,8 @@ with tab_exc:
 with tab_smp:
     st.subheader("Sample definition")
     sample_type = st.radio("Sample type", ["Uniform specimen (optional flaw)",
-                                           "Voronoi polycrystal (anisotropic grains)"])
+                                           "Voronoi polycrystal (anisotropic grains)"],
+                           key="sample_type")
     poly = sample_type.startswith("Voronoi")
 
     cs1, cs2, cs3 = st.columns(3)
@@ -972,1261 +996,1263 @@ with tab_acq:
     else:
         st.info("Run an acquisition to see the received data.")
 
-with tab_img:
-    if "ds" not in st.session_state:
-        st.info("Run an acquisition first.")
-    else:
-        npix = st.slider("Image pixels per axis", 40, 160, 50, 10)
-        with st.spinner("Total focusing method ..."):
-            img, _ = imaging.tfm(st.session_state.ds, npix=npix, half_size=spec_r_m)
-        show_fig(show_model(img, "TFM", cmap="inferno"))
-        st.caption("TFM assumes a constant speed; it images reflectivity, not sound speed.")
+if tab_img is not None:
+    with tab_img:
+        if "ds" not in st.session_state:
+            st.info("Run an acquisition first.")
+        else:
+            npix = st.slider("Image pixels per axis", 40, 160, 50, 10)
+            with st.spinner("Total focusing method ..."):
+                img, _ = imaging.tfm(st.session_state.ds, npix=npix, half_size=spec_r_m)
+            show_fig(show_model(img, "TFM", cmap="inferno"))
+            st.caption("TFM assumes a constant speed; it images reflectivity, not sound speed.")
 
-with tab_fwi:
-    if "ds" not in st.session_state:
-        st.info("Run an acquisition first.")
-    else:
-        n_iter = st.slider("FWI iterations", 4, 16, 8 if poly else 6)
-        _MISFITS = {
-            "L2 (least squares)": "l2",
-            "GCN (normalised cross-correlation)": "gcn",
-            "Envelope (phase-insensitive, unmodelled-physics robust)": "envelope",
-            "Envelope-GCN (scale- and phase-insensitive)": "egcn",
-            "Traveltime (cross-correlation lags, kinematic)": "traveltime",
-            "Graph-space OT (optimal transport, cycle-skip robust)": "gsot",
-        }
-        misfit_choice = st.selectbox(
-            "Misfit functional", list(_MISFITS),
-            index=1 if poly else 0,
-            help="L2/GCN compare waveforms (C++ accelerated). Envelope and "
-                 "Envelope-GCN compare Hilbert envelopes — robust when the "
-                 "operator cannot model the waveform physics (anisotropy, "
-                 "elasticity). Traveltime penalises per-trace arrival lags — "
-                 "the purely kinematic observable that anisotropic wave speeds "
-                 "perturb. The robust misfits run on the Python core (slower).")
-        mtype = _MISFITS[misfit_choice]
-        opt_choice = st.selectbox(
-            "Optimiser",
-            ["Gradient descent (line search)",
-             "Gauss-Newton (Jacobian iterations)"],
-            help="Gauss-Newton solves (JtJ + mu I) dm = -g with conjugate "
-                 "gradients using the exact Born linearisation — the "
-                 "curvature-aware Jacobian iteration. Far fewer outer "
-                 "iterations, but each costs roughly n_cg gradient "
-                 "iterations. L2 misfit only.")
-        use_gn = opt_choice.startswith("Gauss")
-        if use_gn and mtype != "l2":
-            st.info("Gauss-Newton is defined for the L2 misfit; using L2 for "
-                    "this run.")
-            mtype = "l2"
-        if use_gn:
-            st.caption("Each Gauss-Newton iteration runs ~8 CG steps of "
-                       "Born+adjoint solves (Python core): expect roughly 10x "
-                       "the time of a gradient iteration, but far fewer "
-                       "iterations needed (4 is usually plenty).")
-        if mtype == "gcn":
-            st.caption("GCN widens the convergence basin against cycle skipping; "
-                       "amplitude-insensitive per trace (C++ accelerated).")
-        elif mtype in ("envelope", "egcn", "traveltime", "gsot"):
-            st.caption("Robust misfit: adjoint source verified by finite-difference "
-                       "gradient check; runs on the Python core, so iterations are "
-                       "slower than L2/GCN."
-                       + (" GSOT additionally solves an optimal assignment per trace "
-                          "(heaviest, most convex)." if mtype == "gsot" else ""))
-        if poly:
-            st.caption("The data are full 3D anisotropic elastic; acoustic FWI "
-                       "reconstructs an APPARENT velocity field (compare against the "
-                       "per-grain apparent-qP reference) — the model-mismatch question "
-                       "this platform is built to study. GCN misfit and a smoothed "
-                       "gradient are the defaults here: they suppress the source-imprint "
-                       "artefacts the elastic/acoustic mismatch otherwise produces.")
-        # Incremental FWI: ONE iteration per Streamlit rerun so the progress
-        # bar repaints between iterations (required in the in-browser build).
-        _fwi_sig = (n, nt, mtype, use_gn, n_iter, poly)
-        progress_widget()
-        if st.button("Run FWI", type="primary",
-                     disabled="fwi_job" in st.session_state):
-            st.session_state.fwi_job = dict(
-                m=phantom.velocity_to_m(c_bg), it=0, hist=[], t0=time.time(),
-                sig=_fwi_sig)
-            st.rerun()
-
-        fjob = st.session_state.get("fwi_job")
-        if fjob is not None:
-            if fjob["sig"] != _fwi_sig:
-                del st.session_state.fwi_job
-                js_progress(done=True)
-                st.warning("Configuration changed during FWI; run aborted.")
-            else:
-                ds = st.session_state.ds
-                coords = np.mgrid[0:n, 0:n, 0:n].astype(float) * h
-                cc = (n - 1) * h / 2
-                r = np.sqrt((coords[1] - cc) ** 2 + (coords[2] - cc) ** 2)
-                mask = (r <= spec_r_m * (0.85 if poly else 0.95)).astype(float)
-                if poly:
-                    hi_v = max(float(c_true.max()), c_coup) * 1.06
-                    lo_v = min(float(c_true[c_true > 0].min()), c_coup) * 0.9
-                    m_bounds = (phantom.velocity_to_m(hi_v), phantom.velocity_to_m(lo_v))
-                else:
-                    m_bounds = (phantom.velocity_to_m(c_spec + 700),
-                                phantom.velocity_to_m(min(flaw_c, c_spec) - 500))
-                wav_rec = st.session_state.get("wavelet_eff", wavelet_rec)
-                # Backend choice per run: GPU for L2 point-element inversions,
-                # C++ for L2/GCN, Python otherwise (robust misfits, apertures,
-                # Gauss-Newton runs its own Python path).
-                if GPU_BACKEND is not None and mtype == "l2" and footprints is None:
-                    backend = GPU_BACKEND
-                elif BACKEND is not fwi and footprints is None:
-                    backend = BACKEND
-                else:
-                    backend = None
-
-                it = fjob["it"]
-                elapsed = time.time() - fjob["t0"]
-                eta = elapsed / max(it, 1) * (n_iter - it)
-                msg = (f"FWI: iteration {it + 1}/{n_iter} ({mtype.upper()})"
-                       + (f" ({hms(elapsed)} elapsed, ~{hms(eta)} remaining)"
-                          if it else " ..."))
-                js_progress(it / n_iter, msg)       # paints even while Python runs
-                if not IN_BROWSER:
-                    st.progress(it / n_iter, text=msg)
-                m_new, hseg = fwi.invert(
-                    fjob["m"], ring, wav_rec, dt, h, nt, ds.data,
-                    src_list=st.session_state.get("src_list"), n_iter=1,
-                    step_frac=0.03, update_mask=mask, m_bounds=m_bounds,
-                    backend=backend, misfit_type=mtype, footprints=footprints,
-                    smooth_sigma=2.0 if poly else 1.0,
-                    optimizer="gauss-newton" if use_gn else "gd")
-                fjob["hist"].append(hseg[0])
-                stalled = len(hseg) >= 2 and hseg[-1] >= hseg[0] * (1 - 1e-12)
-                fjob["m"] = m_new
-                fjob["it"] += 1
-                if fjob["it"] < n_iter and not stalled:
-                    st.rerun()
-                fjob["hist"].append(hseg[-1])
-                js_progress(done=True)
-                st.session_state.rec = (phantom.m_to_velocity(fjob["m"]),
-                                        fjob["hist"])
-                del st.session_state.fwi_job
-        if "rec" in st.session_state:
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-            c_rec, hist = st.session_state.rec
-            mm = np.arange(n) * h * 1e3
-
-            def slice_fig(vol, title):
-                fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.06,
-                                    subplot_titles=["xy (mid z)", "xz (mid y)", "yz (mid x)"])
-                views = [(vol[n // 2], (0, 1)), (vol[:, n // 2, :], (0, 2)),
-                         (vol[:, :, n // 2], (1, 2))]
-                p = elem_abs * 1e3
-                for col, (sl, cols) in enumerate(views, start=1):
-                    fig.add_trace(go.Heatmap(
-                        z=sl, x=mm, y=mm, coloraxis="coloraxis",
-                        hovertemplate="%{x:.1f}, %{y:.1f} mm | %{z:.0f} m/s<extra></extra>"),
-                        1, col)
-                    fig.add_trace(go.Scatter(
-                        x=p[:, cols[0]], y=p[:, cols[1]], mode="markers",
-                        marker=dict(size=6, symbol="circle-open", color="#00e5ff",
-                                    line=dict(width=1.2)),
-                        showlegend=False, hoverinfo="skip"), 1, col)
-                fig.update_layout(
-                    title=title, height=330, margin=dict(l=10, r=10, t=60, b=10),
-                    coloraxis=dict(colorscale="Viridis", cmin=vlo, cmax=vhi,
-                                   colorbar=dict(title="m/s")))
-                return fig
-
-            def volume_fig(vol, title):
-                zc, yc, xc = np.meshgrid(mm, mm, mm, indexing="ij")
-                fig = go.Figure(go.Volume(
-                    x=xc.ravel(), y=yc.ravel(), z=zc.ravel(), value=vol.ravel(),
-                    isomin=vlo, isomax=vhi, opacity=0.08, surface_count=14,
-                    colorscale="Viridis", colorbar=dict(title="m/s"),
-                    caps=dict(x_show=False, y_show=False, z_show=False)))
-                fig.add_trace(go.Scatter3d(
-                    x=elem_abs[:, 0] * 1e3, y=elem_abs[:, 1] * 1e3, z=elem_abs[:, 2] * 1e3,
-                    mode="markers", marker=dict(size=3, color="#00e5ff"),
-                    showlegend=False))
-                fig.update_layout(title=title, height=430,
-                                  margin=dict(l=0, r=0, t=40, b=0),
-                                  scene=dict(xaxis_title="x (mm)", yaxis_title="y (mm)",
-                                             zaxis_title="z (mm)"))
-                return fig
-
-            true_title = "Apparent qP speed (true)" if poly else "True model"
-            st.plotly_chart(slice_fig(c_true, true_title), width="stretch")
-            st.plotly_chart(slice_fig(c_rec, "FWI reconstruction"), width="stretch")
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                st.plotly_chart(volume_fig(c_true, f"{true_title} (3D volume)"),
-                                width="stretch")
-            with cc2:
-                st.plotly_chart(volume_fig(c_rec, "FWI reconstruction (3D volume)"),
-                                width="stretch")
-            st.caption("3D volume views: colour and opacity follow sound speed, so the "
-                       "couplant is transparent and the specimen structure is visible. "
-                       "Rotate and zoom; hover the slices for exact speeds.")
-            figm = go.Figure(go.Scatter(y=np.array(hist) / hist[0],
-                                        mode="lines+markers", name="misfit"))
-            figm.update_yaxes(type="log", title="relative misfit")
-            figm.update_layout(title="Misfit convergence", xaxis_title="iteration",
-                               height=280, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(figm, width="stretch")
-            st.success(f"Misfit reduced to {hist[-1]/hist[0]*100:.1f}% of initial")
-
-        if poly:
-            st.divider()
-            st.subheader("Grain-orientation (COF) inversion (from known geometry)")
-            st.caption("Solves for what the polycrystal actually is: the 3D c-axis "
-                       "of every grain, with the full elastic forward and the known "
-                       "grain geometry and material (velocity never appears in the "
-                       "parameter vector). Coarse hemisphere search per grain, then "
-                       "Levenberg-Marquardt Jacobian iterations.")
-            G = len(axes3)
-            co1, co2, co3, co4 = st.columns(4)
-            with co1:
-                cof_tx = st.slider("Transmits used", 2, len(src_list),
-                                   min(4, len(src_list)), key="cof_tx")
-            with co2:
-                cof_dirs = st.slider("Coarse directions", 8, 24, 16, key="cof_dirs",
-                     help="16+ keeps every grain within the Jacobian iterations' convergence basin; fewer is faster but can strand a grain.")
-            with co3:
-                cof_sweeps = st.slider("Coarse sweeps", 1, 2, 2, key="cof_sweeps")
-            with co4:
-                cof_lm = st.slider("Jacobian iterations", 0, 6, 3, key="cof_lm")
-            est = 1 + cof_sweeps * G * cof_dirs + cof_lm * (3 + 2 * G)
-            st.caption(f"About {est} forward evaluations of {cof_tx} transmits each "
-                       f"({G} grains). Fewer grains in the Sample tab = much faster.")
-
+if tab_fwi is not None:
+    with tab_fwi:
+        if "ds" not in st.session_state:
+            st.info("Run an acquisition first.")
+        else:
+            n_iter = st.slider("FWI iterations", 4, 16, 8 if poly else 6)
+            _MISFITS = {
+                "L2 (least squares)": "l2",
+                "GCN (normalised cross-correlation)": "gcn",
+                "Envelope (phase-insensitive, unmodelled-physics robust)": "envelope",
+                "Envelope-GCN (scale- and phase-insensitive)": "egcn",
+                "Traveltime (cross-correlation lags, kinematic)": "traveltime",
+                "Graph-space OT (optimal transport, cycle-skip robust)": "gsot",
+            }
+            misfit_choice = st.selectbox(
+                "Misfit functional", list(_MISFITS),
+                index=1 if poly else 0,
+                help="L2/GCN compare waveforms (C++ accelerated). Envelope and "
+                     "Envelope-GCN compare Hilbert envelopes — robust when the "
+                     "operator cannot model the waveform physics (anisotropy, "
+                     "elasticity). Traveltime penalises per-trace arrival lags — "
+                     "the purely kinematic observable that anisotropic wave speeds "
+                     "perturb. The robust misfits run on the Python core (slower).")
+            mtype = _MISFITS[misfit_choice]
+            opt_choice = st.selectbox(
+                "Optimiser",
+                ["Gradient descent (line search)",
+                 "Gauss-Newton (Jacobian iterations)"],
+                help="Gauss-Newton solves (JtJ + mu I) dm = -g with conjugate "
+                     "gradients using the exact Born linearisation — the "
+                     "curvature-aware Jacobian iteration. Far fewer outer "
+                     "iterations, but each costs roughly n_cg gradient "
+                     "iterations. L2 misfit only.")
+            use_gn = opt_choice.startswith("Gauss")
+            if use_gn and mtype != "l2":
+                st.info("Gauss-Newton is defined for the L2 misfit; using L2 for "
+                        "this run.")
+                mtype = "l2"
+            if use_gn:
+                st.caption("Each Gauss-Newton iteration runs ~8 CG steps of "
+                           "Born+adjoint solves (Python core): expect roughly 10x "
+                           "the time of a gradient iteration, but far fewer "
+                           "iterations needed (4 is usually plenty).")
+            if mtype == "gcn":
+                st.caption("GCN widens the convergence basin against cycle skipping; "
+                           "amplitude-insensitive per trace (C++ accelerated).")
+            elif mtype in ("envelope", "egcn", "traveltime", "gsot"):
+                st.caption("Robust misfit: adjoint source verified by finite-difference "
+                           "gradient check; runs on the Python core, so iterations are "
+                           "slower than L2/GCN."
+                           + (" GSOT additionally solves an optimal assignment per trace "
+                              "(heaviest, most convex)." if mtype == "gsot" else ""))
+            if poly:
+                st.caption("The data are full 3D anisotropic elastic; acoustic FWI "
+                           "reconstructs an APPARENT velocity field (compare against the "
+                           "per-grain apparent-qP reference) — the model-mismatch question "
+                           "this platform is built to study. GCN misfit and a smoothed "
+                           "gradient are the defaults here: they suppress the source-imprint "
+                           "artefacts the elastic/acoustic mismatch otherwise produces.")
+            # Incremental FWI: ONE iteration per Streamlit rerun so the progress
+            # bar repaints between iterations (required in the in-browser build).
+            _fwi_sig = (n, nt, mtype, use_gn, n_iter, poly)
             progress_widget()
-            _cof_sig = (n, nt, G, int(seed), cof_tx, cof_dirs, cof_sweeps, cof_lm,
-                        tuple(src_list))
-            if st.button("Recover grain orientations", type="primary",
-                         disabled="cof_job" in st.session_state, key="cof_btn"):
-                sel = np.linspace(0, len(src_list) - 1, cof_tx).astype(int)
-                st.session_state.cof_job = dict(
-                    sig=_cof_sig, t0=time.time(), evals=0, est=est,
-                    tx_sel=[int(i) for i in dict.fromkeys(sel)],
-                    phase="init", axes=np.tile([0.0, 0.0, 1.0], (G, 1)),
-                    j_cur=None, sweep=0, grain=0, diri=0,
-                    best_j=None, best_a=None, hist=[],
-                    lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
-                            J=None, Jac=None, col=0, trial=0))
-                st.session_state.pop("cof_result", None)
+            if st.button("Run FWI", type="primary",
+                         disabled="fwi_job" in st.session_state):
+                st.session_state.fwi_job = dict(
+                    m=phantom.velocity_to_m(c_bg), it=0, hist=[], t0=time.time(),
+                    sig=_fwi_sig)
                 st.rerun()
 
-            cjob = st.session_state.get("cof_job")
-            if cjob is not None and cjob["sig"] != _cof_sig:
-                del st.session_state.cof_job
-                js_progress(done=True)
-                st.warning("Configuration changed during the COF inversion; run aborted.")
-                cjob = None
-            if cjob is not None:
-                ds = st.session_state.ds
-                src_sub = [src_list[i] for i in cjob["tx_sel"]]
-                dobs_sub = ds.data[cjob["tx_sel"]]
-                residual = cof.make_residual(
-                    labels, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
-                    material=material,
-                    filter_fn=lambda d: apply_rx_filter(d, axis=1))
-
-                def Jof(axes_or_p, is_params=False):
-                    p_ = axes_or_p if is_params else cof.params_from_axes(axes_or_p)
-                    r_ = residual(np.asarray(p_))
-                    return 0.5 * float(r_ @ r_), r_
-
-                frac = cjob["evals"] / max(cjob["est"], 1)
-                el = time.time() - cjob["t0"]
-                eta = el / max(cjob["evals"], 1) * max(cjob["est"] - cjob["evals"], 0)
-                msg = (f"COF inversion [{cjob['phase']}]: evaluation "
-                       f"{cjob['evals'] + 1}/~{cjob['est']}"
-                       + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
-                          if cjob["evals"] else " ..."))
-                js_progress(min(frac, 1.0), msg)
-                if not IN_BROWSER:
-                    st.progress(min(frac, 1.0), text=msg)
-
-                hemi = [d if d[2] >= 0 else -d
-                        for d in _fibonacci_directions(cof_dirs, hemisphere=True)]
-                done = False
-                if cjob["phase"] == "init":
-                    J0, _ = Jof(cjob["axes"])
-                    cjob["j_cur"] = J0
-                    cjob["hist"].append(J0)
-                    cjob["best_j"], cjob["best_a"] = J0, cjob["axes"][0].copy()
-                    cjob["phase"] = "coarse"
-                elif cjob["phase"] == "coarse":
-                    g_i, d_i = cjob["grain"], cjob["diri"]
-                    axes_try = cjob["axes"].copy()
-                    axes_try[g_i] = hemi[d_i]
-                    Jt, _ = Jof(axes_try)
-                    if Jt < cjob["best_j"]:
-                        cjob["best_j"], cjob["best_a"] = Jt, np.array(hemi[d_i])
-                    cjob["diri"] += 1
-                    if cjob["diri"] >= cof_dirs:
-                        cjob["axes"][g_i] = cjob["best_a"]
-                        cjob["j_cur"] = cjob["best_j"]
-                        cjob["hist"].append(cjob["j_cur"])
-                        cjob["diri"] = 0
-                        cjob["grain"] += 1
-                        if cjob["grain"] >= G:
-                            cjob["grain"] = 0
-                            cjob["sweep"] += 1
-                            if cjob["sweep"] >= cof_sweeps:
-                                if cof_lm > 0:
-                                    cjob["phase"] = "lm"
-                                    cjob["lm"]["p"] = cof.params_from_axes(
-                                        cjob["axes"]).ravel()
-                                else:
-                                    done = True
-                        cjob["best_j"] = cjob["j_cur"]
-                        cjob["best_a"] = cjob["axes"][cjob["grain"] % G].copy()
-                else:                                   # Levenberg-Marquardt
-                    lm = cjob["lm"]
-                    fd = np.radians(2.0)
-                    if lm["sub"] == "base":
-                        lm["J"], lm["r"] = Jof(lm["p"], is_params=True)
-                        cjob["hist"].append(lm["J"])
-                        lm["Jac"] = np.empty((lm["r"].size, lm["p"].size))
-                        lm["sub"] = "col"
-                        lm["col"] = 0
-                    elif lm["sub"] == "col":
-                        k = lm["col"]
-                        pk = lm["p"].copy()
-                        pk[k] += fd
-                        _, rk = Jof(pk, is_params=True)
-                        lm["Jac"][:, k] = (rk - lm["r"]) / fd
-                        lm["col"] += 1
-                        if lm["col"] >= lm["p"].size:
-                            lm["sub"] = "trial"
-                            lm["trial"] = 0
-                    else:                               # trial step at current lam
-                        Jc = lm["Jac"]
-                        gv = Jc.T @ lm["r"]
-                        Hm = Jc.T @ Jc
-                        step = np.linalg.solve(
-                            Hm + lm["lam"] * np.diag(np.diag(Hm) + 1e-30), -gv)
-                        p_try = lm["p"] + step
-                        J_try, _ = Jof(p_try, is_params=True)
-                        if J_try < lm["J"]:
-                            lm["p"] = p_try
-                            lm["lam"] = max(lm["lam"] / 3.0, 1e-8)
-                            lm["it"] += 1
-                            lm["sub"] = "base"
-                            if lm["it"] >= cof_lm:
-                                cjob["axes"] = cof.axes_from_params(lm["p"])
-                                done = True
-                        else:
-                            lm["lam"] *= 5.0
-                            lm["trial"] += 1
-                            if lm["trial"] >= 5:        # stalled: accept current
-                                cjob["axes"] = cof.axes_from_params(lm["p"])
-                                done = True
-                cjob["evals"] += 1
-                if not done:
-                    st.rerun()
-                js_progress(done=True)
-                axes_rec = np.asarray(cjob["axes"])
-                errs = [cof.axis_error_deg(axes_rec[k], axes3[k])
-                        for k in range(G)]
-                st.session_state.cof_result = dict(
-                    axes=axes_rec, errs=errs, hist=list(cjob["hist"]),
-                    evals=cjob["evals"], secs=time.time() - cjob["t0"])
-                del st.session_state.cof_job
-
-            cres = st.session_state.get("cof_result")
-            if cres is not None:
-                errs = cres["errs"]
-                st.success(f"Recovered {G} grain orientations in {cres['evals']} "
-                           f"evaluations ({hms(cres['secs'])}): mean axis error "
-                           f"{np.mean(errs):.1f} deg, max {np.max(errs):.1f} deg")
-                rows = ["| grain | true axis | recovered | error |",
-                        "|---|---|---|---|"]
-                for k in range(G):
-                    rows.append(f"| {k} | {np.round(axes3[k], 2)} | "
-                                f"{np.round(cres['axes'][k], 2)} | "
-                                f"{errs[k]:.1f} deg |")
-                st.markdown("\n".join(rows))
-                colat_t = np.degrees(np.arccos(np.clip(np.abs(axes3[:, 2]), 0, 1)))
-                colat_r = np.degrees(np.arccos(
-                    np.clip(np.abs(cres["axes"][:, 2]), 0, 1)))
-                cta, ctb = st.columns(2)
-                with cta:
-                    st.plotly_chart(render3d.polycrystal_figure(
-                        labels, colat_t, h, "True c-axis colatitude",
-                        vmin=0, vmax=90), width="stretch")
-                with ctb:
-                    st.plotly_chart(render3d.polycrystal_figure(
-                        labels, colat_r, h, "Recovered colatitude",
-                        vmin=0, vmax=90), width="stretch")
-                import plotly.graph_objects as go
-                fh = go.Figure(go.Scatter(y=cres["hist"], mode="lines+markers"))
-                fh.update_yaxes(type="log", title="misfit")
-                fh.update_layout(title="COF inversion convergence",
-                                 xaxis_title="accepted update", height=260,
-                                 margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fh, width="stretch")
-
-            st.divider()
-            st.subheader("Orientation-field inversion (unknown geometry)")
-            st.caption("No grain labels anywhere: every voxel carries its own "
-                       "c-axis (a function of velocity at every angle), and "
-                       "grains emerge as regions where the recovered field is "
-                       "constant. Global coarse search on regular pseudo-grain "
-                       "blocks, then exact-adjoint voxel descent with "
-                       "orientation-tensor smoothing. Experimental; the full "
-                       "3D elastic adjoint runs once per transmit per "
-                       "iteration, so keep the grid modest.")
-            of_mask = labels >= 0
-            uf1, uf2, uf3, uf4, uf5, uf6 = st.columns(6)
-            with uf1:
-                of_tx = st.slider("Transmits", 2, len(src_list),
-                                  min(4, len(src_list)), key="of_tx")
-            with uf2:
-                of_div = st.slider("Blocks per axis", 1, 3, 3, key="of_div",
-                                   help="Coarse pseudo-grain partition for the global "
-                                        "initial search; blocks need not match any "
-                                        "true grain. Smaller blocks straddle fewer "
-                                        "grains, so more of the volume starts inside "
-                                        "the local convergence basin.")
-            with uf3:
-                of_dirs = st.slider("Coarse directions", 6, 24, 16, key="of_dirs")
-            with uf4:
-                of_iters = st.slider("Voxel iterations", 0, 20, 6, key="of_iters")
-            with uf5:
-                of_sigma = st.slider("Smoothing (voxels)", 0.0, 3.0, 1.5, 0.5,
-                                     key="of_sigma",
-                                     help="Gaussian smoothing of the orientation "
-                                          "gradient each iteration (the 2D "
-                                          "theta-field regularisation); uphill "
-                                          "iterations are rejected and the step "
-                                          "halved.")
-            with uf6:
-                of_seg = st.slider("Re-search segments", 0, 12, 8, key="of_seg",
-                                   help="After voxel descent, cluster the field "
-                                        "into emergent grains and globally "
-                                        "re-search the largest ones -- the escape "
-                                        "hatch for regions stranded in the wrong "
-                                        "basin. 0 disables the stage.")
-            _blab, _nb = axisfield.block_partition(of_mask, of_div)
-            of_est = 1 + _nb * of_dirs + of_iters * of_tx
-            if of_seg > 0:
-                of_est += 1 + of_seg * of_dirs + of_iters * of_tx
-            st.caption(f"About {_nb * of_dirs} coarse evaluations of {of_tx} "
-                       f"transmits, {of_iters} adjoint iterations "
-                       + (f", then up to {of_seg} segments x {of_dirs} "
-                          f"directions re-searched and {of_iters} more "
-                          f"iterations " if of_seg > 0 else "")
-                       + f"({_nb} blocks, {int(of_mask.sum())} unknown voxels "
-                         f"x 2 angles).")
-
-            progress_widget()
-            _of_sig = (n, nt, int(seed), of_tx, of_div, of_dirs, of_iters,
-                       float(of_sigma), int(of_seg), tuple(src_list))
-            if st.button("Recover orientation field", type="primary",
-                         disabled="of_job" in st.session_state, key="of_btn"):
-                sel = np.linspace(0, len(src_list) - 1, of_tx).astype(int)
-                st.session_state.of_job = dict(
-                    sig=_of_sig, t0=time.time(), evals=0, est=of_est,
-                    tx_sel=[int(i) for i in dict.fromkeys(sel)],
-                    phase="init", blab=_blab, nb=_nb,
-                    baxes=np.tile([0.0, 0.0, 1.0], (_nb, 1)),
-                    best_j=None, best_a=None, blk=0, diri=0,
-                    colat=None, azim=None, it=0, txi=0, Jacc=0.0,
-                    gt=None, gp=None, hist=[], srate=0.3,
-                    bJ=None, bcolat=None, bazim=None, bgt=None, bgp=None,
-                    seg=None, seg_ids=None, seg_i=0, seg_d=0,
-                    sbj=None, sbd=None, round2=False)
-                st.session_state.pop("of_result", None)
-                st.rerun()
-
-            ojob = st.session_state.get("of_job")
-            if ojob is not None and ojob["sig"] != _of_sig:
-                del st.session_state.of_job
-                js_progress(done=True)
-                st.warning("Configuration changed during the orientation-field "
-                           "inversion; run aborted.")
-                ojob = None
-            if ojob is not None:
-                ds = st.session_state.ds
-                src_sub = [src_list[i] for i in ojob["tx_sel"]]
-                dobs_sub = ds.data[ojob["tx_sel"]]
-                base6 = anisotropy.ti_stiffness_6(**material)
-                K_bg = 1000.0 * 1480.0 ** 2
-                Cbg = {k: np.full((n, n, n),
-                                  K_bg if (int(k[1]) <= 3 and int(k[2]) <= 3)
-                                  else 0.0)
-                       for k in axisfield.KEYS21}
-                # per-trace normalisation, self-trace excluded (the COF misfit)
-                _trn = np.sqrt(np.sum(dobs_sub ** 2, axis=1)) + 1e-30
-                _wtr = np.ones_like(_trn)
-                for _i, _s in enumerate(src_sub):
-                    _wtr[_i, _s] = 0.0
-                tw_list = [(_wtr / _trn)[_i] for _i in range(len(src_sub))]
-
-                frac = ojob["evals"] / max(ojob["est"], 1)
-                el = time.time() - ojob["t0"]
-                eta = el / max(ojob["evals"], 1) * max(ojob["est"] - ojob["evals"], 0)
-                msg = (f"Orientation field [{ojob['phase']}]: evaluation "
-                       f"{ojob['evals'] + 1}/~{ojob['est']}"
-                       + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
-                          if ojob["evals"] else " ..."))
-                js_progress(min(frac, 1.0), msg)
-                if not IN_BROWSER:
-                    st.progress(min(frac, 1.0), text=msg)
-
-                hemi = [d if d[2] >= 0 else -d
-                        for d in _fibonacci_directions(of_dirs,
-                                                       hemisphere=True)]
-                rec_grp_all = [([idx], [1.0]) for idx in ring.idx]
-                src_pts_all = [[(ring.element_index(s), 1.0)]
-                               for s in src_sub]
-
-                def _field_J(cl, az):
-                    return axisfield.field_misfit(
-                        cl, az, of_mask, base6, Cbg, 1000.0, material["rho"],
-                        h, dt, nt, src_pts_all, wavelet_eff, rec_grp_all,
-                        dobs_sub, trace_weights=tw_list, device="auto")
-
-                def _enter_second_descent():
-                    ojob["round2"] = True
-                    ojob["colat"] = ojob["bcolat"].copy()
-                    ojob["azim"] = ojob["bazim"].copy()
-                    ojob["bJ"] = None       # fresh guard, field is the best
-                    ojob["bgt"] = ojob["bgp"] = None
-                    ojob["it"] = 0
-                    ojob["srate"] = 0.3
-                    ojob["phase"] = "voxel"
-                    return of_iters == 0    # nothing left to run
-
-                done = False
-                if ojob["phase"] in ("init", "coarse"):
-                    residual = cof.make_residual(
-                        ojob["blab"], ring, h, dt, nt, wavelet, src_sub,
-                        dobs_sub, material=material,
-                        filter_fn=lambda d: apply_rx_filter(d, axis=1))
-
-                    def Jof(bax):
-                        r_ = residual(cof.params_from_axes(bax))
-                        return 0.5 * float(r_ @ r_)
-
-                    if ojob["phase"] == "init":
-                        J0 = Jof(ojob["baxes"])
-                        ojob["hist"].append(J0)
-                        ojob["best_j"] = J0
-                        ojob["best_a"] = ojob["baxes"][0].copy()
-                        ojob["phase"] = "coarse"
+            fjob = st.session_state.get("fwi_job")
+            if fjob is not None:
+                if fjob["sig"] != _fwi_sig:
+                    del st.session_state.fwi_job
+                    js_progress(done=True)
+                    st.warning("Configuration changed during FWI; run aborted.")
+                else:
+                    ds = st.session_state.ds
+                    coords = np.mgrid[0:n, 0:n, 0:n].astype(float) * h
+                    cc = (n - 1) * h / 2
+                    r = np.sqrt((coords[1] - cc) ** 2 + (coords[2] - cc) ** 2)
+                    mask = (r <= spec_r_m * (0.85 if poly else 0.95)).astype(float)
+                    if poly:
+                        hi_v = max(float(c_true.max()), c_coup) * 1.06
+                        lo_v = min(float(c_true[c_true > 0].min()), c_coup) * 0.9
+                        m_bounds = (phantom.velocity_to_m(hi_v), phantom.velocity_to_m(lo_v))
                     else:
-                        b_i, d_i = ojob["blk"], ojob["diri"]
-                        bax_try = ojob["baxes"].copy()
-                        bax_try[b_i] = hemi[d_i]
-                        Jt = Jof(bax_try)
-                        if Jt < ojob["best_j"]:
-                            ojob["best_j"] = Jt
-                            ojob["best_a"] = np.array(hemi[d_i])
-                        ojob["diri"] += 1
-                        if ojob["diri"] >= of_dirs:
-                            ojob["baxes"][b_i] = ojob["best_a"]
-                            ojob["hist"].append(ojob["best_j"])
-                            ojob["diri"] = 0
-                            ojob["blk"] += 1
-                            if ojob["blk"] >= ojob["nb"]:
-                                ojob["colat"], ojob["azim"] = \
-                                    axisfield.axes_to_field(
-                                        ojob["blab"], ojob["baxes"], of_mask)
-                                ojob["phase"] = "voxel"
-                                if of_iters == 0:
-                                    if of_seg > 0:
+                        m_bounds = (phantom.velocity_to_m(c_spec + 700),
+                                    phantom.velocity_to_m(min(flaw_c, c_spec) - 500))
+                    wav_rec = st.session_state.get("wavelet_eff", wavelet_rec)
+                    # Backend choice per run: GPU for L2 point-element inversions,
+                    # C++ for L2/GCN, Python otherwise (robust misfits, apertures,
+                    # Gauss-Newton runs its own Python path).
+                    if GPU_BACKEND is not None and mtype == "l2" and footprints is None:
+                        backend = GPU_BACKEND
+                    elif BACKEND is not fwi and footprints is None:
+                        backend = BACKEND
+                    else:
+                        backend = None
+
+                    it = fjob["it"]
+                    elapsed = time.time() - fjob["t0"]
+                    eta = elapsed / max(it, 1) * (n_iter - it)
+                    msg = (f"FWI: iteration {it + 1}/{n_iter} ({mtype.upper()})"
+                           + (f" ({hms(elapsed)} elapsed, ~{hms(eta)} remaining)"
+                              if it else " ..."))
+                    js_progress(it / n_iter, msg)       # paints even while Python runs
+                    if not IN_BROWSER:
+                        st.progress(it / n_iter, text=msg)
+                    m_new, hseg = fwi.invert(
+                        fjob["m"], ring, wav_rec, dt, h, nt, ds.data,
+                        src_list=st.session_state.get("src_list"), n_iter=1,
+                        step_frac=0.03, update_mask=mask, m_bounds=m_bounds,
+                        backend=backend, misfit_type=mtype, footprints=footprints,
+                        smooth_sigma=2.0 if poly else 1.0,
+                        optimizer="gauss-newton" if use_gn else "gd")
+                    fjob["hist"].append(hseg[0])
+                    stalled = len(hseg) >= 2 and hseg[-1] >= hseg[0] * (1 - 1e-12)
+                    fjob["m"] = m_new
+                    fjob["it"] += 1
+                    if fjob["it"] < n_iter and not stalled:
+                        st.rerun()
+                    fjob["hist"].append(hseg[-1])
+                    js_progress(done=True)
+                    st.session_state.rec = (phantom.m_to_velocity(fjob["m"]),
+                                            fjob["hist"])
+                    del st.session_state.fwi_job
+            if "rec" in st.session_state:
+                import plotly.graph_objects as go
+                from plotly.subplots import make_subplots
+                c_rec, hist = st.session_state.rec
+                mm = np.arange(n) * h * 1e3
+
+                def slice_fig(vol, title):
+                    fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.06,
+                                        subplot_titles=["xy (mid z)", "xz (mid y)", "yz (mid x)"])
+                    views = [(vol[n // 2], (0, 1)), (vol[:, n // 2, :], (0, 2)),
+                             (vol[:, :, n // 2], (1, 2))]
+                    p = elem_abs * 1e3
+                    for col, (sl, cols) in enumerate(views, start=1):
+                        fig.add_trace(go.Heatmap(
+                            z=sl, x=mm, y=mm, coloraxis="coloraxis",
+                            hovertemplate="%{x:.1f}, %{y:.1f} mm | %{z:.0f} m/s<extra></extra>"),
+                            1, col)
+                        fig.add_trace(go.Scatter(
+                            x=p[:, cols[0]], y=p[:, cols[1]], mode="markers",
+                            marker=dict(size=6, symbol="circle-open", color="#00e5ff",
+                                        line=dict(width=1.2)),
+                            showlegend=False, hoverinfo="skip"), 1, col)
+                    fig.update_layout(
+                        title=title, height=330, margin=dict(l=10, r=10, t=60, b=10),
+                        coloraxis=dict(colorscale="Viridis", cmin=vlo, cmax=vhi,
+                                       colorbar=dict(title="m/s")))
+                    return fig
+
+                def volume_fig(vol, title):
+                    zc, yc, xc = np.meshgrid(mm, mm, mm, indexing="ij")
+                    fig = go.Figure(go.Volume(
+                        x=xc.ravel(), y=yc.ravel(), z=zc.ravel(), value=vol.ravel(),
+                        isomin=vlo, isomax=vhi, opacity=0.08, surface_count=14,
+                        colorscale="Viridis", colorbar=dict(title="m/s"),
+                        caps=dict(x_show=False, y_show=False, z_show=False)))
+                    fig.add_trace(go.Scatter3d(
+                        x=elem_abs[:, 0] * 1e3, y=elem_abs[:, 1] * 1e3, z=elem_abs[:, 2] * 1e3,
+                        mode="markers", marker=dict(size=3, color="#00e5ff"),
+                        showlegend=False))
+                    fig.update_layout(title=title, height=430,
+                                      margin=dict(l=0, r=0, t=40, b=0),
+                                      scene=dict(xaxis_title="x (mm)", yaxis_title="y (mm)",
+                                                 zaxis_title="z (mm)"))
+                    return fig
+
+                true_title = "Apparent qP speed (true)" if poly else "True model"
+                st.plotly_chart(slice_fig(c_true, true_title), width="stretch")
+                st.plotly_chart(slice_fig(c_rec, "FWI reconstruction"), width="stretch")
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    st.plotly_chart(volume_fig(c_true, f"{true_title} (3D volume)"),
+                                    width="stretch")
+                with cc2:
+                    st.plotly_chart(volume_fig(c_rec, "FWI reconstruction (3D volume)"),
+                                    width="stretch")
+                st.caption("3D volume views: colour and opacity follow sound speed, so the "
+                           "couplant is transparent and the specimen structure is visible. "
+                           "Rotate and zoom; hover the slices for exact speeds.")
+                figm = go.Figure(go.Scatter(y=np.array(hist) / hist[0],
+                                            mode="lines+markers", name="misfit"))
+                figm.update_yaxes(type="log", title="relative misfit")
+                figm.update_layout(title="Misfit convergence", xaxis_title="iteration",
+                                   height=280, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(figm, width="stretch")
+                st.success(f"Misfit reduced to {hist[-1]/hist[0]*100:.1f}% of initial")
+
+            if poly:
+                with tab_cof:
+                    st.subheader("Grain-orientation (COF) inversion (from known geometry)")
+                    st.caption("Solves for what the polycrystal actually is: the 3D c-axis "
+                               "of every grain, with the full elastic forward and the known "
+                               "grain geometry and material (velocity never appears in the "
+                               "parameter vector). Coarse hemisphere search per grain, then "
+                               "Levenberg-Marquardt Jacobian iterations.")
+                    G = len(axes3)
+                    co1, co2, co3, co4 = st.columns(4)
+                    with co1:
+                        cof_tx = st.slider("Transmits used", 2, len(src_list),
+                                           min(4, len(src_list)), key="cof_tx")
+                    with co2:
+                        cof_dirs = st.slider("Coarse directions", 8, 24, 16, key="cof_dirs",
+                             help="16+ keeps every grain within the Jacobian iterations' convergence basin; fewer is faster but can strand a grain.")
+                    with co3:
+                        cof_sweeps = st.slider("Coarse sweeps", 1, 2, 2, key="cof_sweeps")
+                    with co4:
+                        cof_lm = st.slider("Jacobian iterations", 0, 6, 3, key="cof_lm")
+                    est = 1 + cof_sweeps * G * cof_dirs + cof_lm * (3 + 2 * G)
+                    st.caption(f"About {est} forward evaluations of {cof_tx} transmits each "
+                               f"({G} grains). Fewer grains in the Sample tab = much faster.")
+
+                    progress_widget()
+                    _cof_sig = (n, nt, G, int(seed), cof_tx, cof_dirs, cof_sweeps, cof_lm,
+                                tuple(src_list))
+                    if st.button("Recover grain orientations", type="primary",
+                                 disabled="cof_job" in st.session_state, key="cof_btn"):
+                        sel = np.linspace(0, len(src_list) - 1, cof_tx).astype(int)
+                        st.session_state.cof_job = dict(
+                            sig=_cof_sig, t0=time.time(), evals=0, est=est,
+                            tx_sel=[int(i) for i in dict.fromkeys(sel)],
+                            phase="init", axes=np.tile([0.0, 0.0, 1.0], (G, 1)),
+                            j_cur=None, sweep=0, grain=0, diri=0,
+                            best_j=None, best_a=None, hist=[],
+                            lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
+                                    J=None, Jac=None, col=0, trial=0))
+                        st.session_state.pop("cof_result", None)
+                        st.rerun()
+
+                    cjob = st.session_state.get("cof_job")
+                    if cjob is not None and cjob["sig"] != _cof_sig:
+                        del st.session_state.cof_job
+                        js_progress(done=True)
+                        st.warning("Configuration changed during the COF inversion; run aborted.")
+                        cjob = None
+                    if cjob is not None:
+                        ds = st.session_state.ds
+                        src_sub = [src_list[i] for i in cjob["tx_sel"]]
+                        dobs_sub = ds.data[cjob["tx_sel"]]
+                        residual = cof.make_residual(
+                            labels, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
+                            material=material,
+                            filter_fn=lambda d: apply_rx_filter(d, axis=1))
+
+                        def Jof(axes_or_p, is_params=False):
+                            p_ = axes_or_p if is_params else cof.params_from_axes(axes_or_p)
+                            r_ = residual(np.asarray(p_))
+                            return 0.5 * float(r_ @ r_), r_
+
+                        frac = cjob["evals"] / max(cjob["est"], 1)
+                        el = time.time() - cjob["t0"]
+                        eta = el / max(cjob["evals"], 1) * max(cjob["est"] - cjob["evals"], 0)
+                        msg = (f"COF inversion [{cjob['phase']}]: evaluation "
+                               f"{cjob['evals'] + 1}/~{cjob['est']}"
+                               + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
+                                  if cjob["evals"] else " ..."))
+                        js_progress(min(frac, 1.0), msg)
+                        if not IN_BROWSER:
+                            st.progress(min(frac, 1.0), text=msg)
+
+                        hemi = [d if d[2] >= 0 else -d
+                                for d in _fibonacci_directions(cof_dirs, hemisphere=True)]
+                        done = False
+                        if cjob["phase"] == "init":
+                            J0, _ = Jof(cjob["axes"])
+                            cjob["j_cur"] = J0
+                            cjob["hist"].append(J0)
+                            cjob["best_j"], cjob["best_a"] = J0, cjob["axes"][0].copy()
+                            cjob["phase"] = "coarse"
+                        elif cjob["phase"] == "coarse":
+                            g_i, d_i = cjob["grain"], cjob["diri"]
+                            axes_try = cjob["axes"].copy()
+                            axes_try[g_i] = hemi[d_i]
+                            Jt, _ = Jof(axes_try)
+                            if Jt < cjob["best_j"]:
+                                cjob["best_j"], cjob["best_a"] = Jt, np.array(hemi[d_i])
+                            cjob["diri"] += 1
+                            if cjob["diri"] >= cof_dirs:
+                                cjob["axes"][g_i] = cjob["best_a"]
+                                cjob["j_cur"] = cjob["best_j"]
+                                cjob["hist"].append(cjob["j_cur"])
+                                cjob["diri"] = 0
+                                cjob["grain"] += 1
+                                if cjob["grain"] >= G:
+                                    cjob["grain"] = 0
+                                    cjob["sweep"] += 1
+                                    if cjob["sweep"] >= cof_sweeps:
+                                        if cof_lm > 0:
+                                            cjob["phase"] = "lm"
+                                            cjob["lm"]["p"] = cof.params_from_axes(
+                                                cjob["axes"]).ravel()
+                                        else:
+                                            done = True
+                                cjob["best_j"] = cjob["j_cur"]
+                                cjob["best_a"] = cjob["axes"][cjob["grain"] % G].copy()
+                        else:                                   # Levenberg-Marquardt
+                            lm = cjob["lm"]
+                            fd = np.radians(2.0)
+                            if lm["sub"] == "base":
+                                lm["J"], lm["r"] = Jof(lm["p"], is_params=True)
+                                cjob["hist"].append(lm["J"])
+                                lm["Jac"] = np.empty((lm["r"].size, lm["p"].size))
+                                lm["sub"] = "col"
+                                lm["col"] = 0
+                            elif lm["sub"] == "col":
+                                k = lm["col"]
+                                pk = lm["p"].copy()
+                                pk[k] += fd
+                                _, rk = Jof(pk, is_params=True)
+                                lm["Jac"][:, k] = (rk - lm["r"]) / fd
+                                lm["col"] += 1
+                                if lm["col"] >= lm["p"].size:
+                                    lm["sub"] = "trial"
+                                    lm["trial"] = 0
+                            else:                               # trial step at current lam
+                                Jc = lm["Jac"]
+                                gv = Jc.T @ lm["r"]
+                                Hm = Jc.T @ Jc
+                                step = np.linalg.solve(
+                                    Hm + lm["lam"] * np.diag(np.diag(Hm) + 1e-30), -gv)
+                                p_try = lm["p"] + step
+                                J_try, _ = Jof(p_try, is_params=True)
+                                if J_try < lm["J"]:
+                                    lm["p"] = p_try
+                                    lm["lam"] = max(lm["lam"] / 3.0, 1e-8)
+                                    lm["it"] += 1
+                                    lm["sub"] = "base"
+                                    if lm["it"] >= cof_lm:
+                                        cjob["axes"] = cof.axes_from_params(lm["p"])
+                                        done = True
+                                else:
+                                    lm["lam"] *= 5.0
+                                    lm["trial"] += 1
+                                    if lm["trial"] >= 5:        # stalled: accept current
+                                        cjob["axes"] = cof.axes_from_params(lm["p"])
+                                        done = True
+                        cjob["evals"] += 1
+                        if not done:
+                            st.rerun()
+                        js_progress(done=True)
+                        axes_rec = np.asarray(cjob["axes"])
+                        errs = [cof.axis_error_deg(axes_rec[k], axes3[k])
+                                for k in range(G)]
+                        st.session_state.cof_result = dict(
+                            axes=axes_rec, errs=errs, hist=list(cjob["hist"]),
+                            evals=cjob["evals"], secs=time.time() - cjob["t0"])
+                        del st.session_state.cof_job
+
+                    cres = st.session_state.get("cof_result")
+                    if cres is not None:
+                        errs = cres["errs"]
+                        st.success(f"Recovered {G} grain orientations in {cres['evals']} "
+                                   f"evaluations ({hms(cres['secs'])}): mean axis error "
+                                   f"{np.mean(errs):.1f} deg, max {np.max(errs):.1f} deg")
+                        rows = ["| grain | true axis | recovered | error |",
+                                "|---|---|---|---|"]
+                        for k in range(G):
+                            rows.append(f"| {k} | {np.round(axes3[k], 2)} | "
+                                        f"{np.round(cres['axes'][k], 2)} | "
+                                        f"{errs[k]:.1f} deg |")
+                        st.markdown("\n".join(rows))
+                        colat_t = np.degrees(np.arccos(np.clip(np.abs(axes3[:, 2]), 0, 1)))
+                        colat_r = np.degrees(np.arccos(
+                            np.clip(np.abs(cres["axes"][:, 2]), 0, 1)))
+                        cta, ctb = st.columns(2)
+                        with cta:
+                            st.plotly_chart(render3d.polycrystal_figure(
+                                labels, colat_t, h, "True c-axis colatitude",
+                                vmin=0, vmax=90), width="stretch")
+                        with ctb:
+                            st.plotly_chart(render3d.polycrystal_figure(
+                                labels, colat_r, h, "Recovered colatitude",
+                                vmin=0, vmax=90), width="stretch")
+                        import plotly.graph_objects as go
+                        fh = go.Figure(go.Scatter(y=cres["hist"], mode="lines+markers"))
+                        fh.update_yaxes(type="log", title="misfit")
+                        fh.update_layout(title="COF inversion convergence",
+                                         xaxis_title="accepted update", height=260,
+                                         margin=dict(l=10, r=10, t=40, b=10))
+                        st.plotly_chart(fh, width="stretch")
+
+                with tab_of:
+                    st.subheader("Orientation-field inversion (unknown geometry)")
+                    st.caption("No grain labels anywhere: every voxel carries its own "
+                               "c-axis (a function of velocity at every angle), and "
+                               "grains emerge as regions where the recovered field is "
+                               "constant. Global coarse search on regular pseudo-grain "
+                               "blocks, then exact-adjoint voxel descent with "
+                               "orientation-tensor smoothing. Experimental; the full "
+                               "3D elastic adjoint runs once per transmit per "
+                               "iteration, so keep the grid modest.")
+                    of_mask = labels >= 0
+                    uf1, uf2, uf3, uf4, uf5, uf6 = st.columns(6)
+                    with uf1:
+                        of_tx = st.slider("Transmits", 2, len(src_list),
+                                          min(4, len(src_list)), key="of_tx")
+                    with uf2:
+                        of_div = st.slider("Blocks per axis", 1, 3, 3, key="of_div",
+                                           help="Coarse pseudo-grain partition for the global "
+                                                "initial search; blocks need not match any "
+                                                "true grain. Smaller blocks straddle fewer "
+                                                "grains, so more of the volume starts inside "
+                                                "the local convergence basin.")
+                    with uf3:
+                        of_dirs = st.slider("Coarse directions", 6, 24, 16, key="of_dirs")
+                    with uf4:
+                        of_iters = st.slider("Voxel iterations", 0, 20, 6, key="of_iters")
+                    with uf5:
+                        of_sigma = st.slider("Smoothing (voxels)", 0.0, 3.0, 1.5, 0.5,
+                                             key="of_sigma",
+                                             help="Gaussian smoothing of the orientation "
+                                                  "gradient each iteration (the 2D "
+                                                  "theta-field regularisation); uphill "
+                                                  "iterations are rejected and the step "
+                                                  "halved.")
+                    with uf6:
+                        of_seg = st.slider("Re-search segments", 0, 12, 8, key="of_seg",
+                                           help="After voxel descent, cluster the field "
+                                                "into emergent grains and globally "
+                                                "re-search the largest ones -- the escape "
+                                                "hatch for regions stranded in the wrong "
+                                                "basin. 0 disables the stage.")
+                    _blab, _nb = axisfield.block_partition(of_mask, of_div)
+                    of_est = 1 + _nb * of_dirs + of_iters * of_tx
+                    if of_seg > 0:
+                        of_est += 1 + of_seg * of_dirs + of_iters * of_tx
+                    st.caption(f"About {_nb * of_dirs} coarse evaluations of {of_tx} "
+                               f"transmits, {of_iters} adjoint iterations "
+                               + (f", then up to {of_seg} segments x {of_dirs} "
+                                  f"directions re-searched and {of_iters} more "
+                                  f"iterations " if of_seg > 0 else "")
+                               + f"({_nb} blocks, {int(of_mask.sum())} unknown voxels "
+                                 f"x 2 angles).")
+
+                    progress_widget()
+                    _of_sig = (n, nt, int(seed), of_tx, of_div, of_dirs, of_iters,
+                               float(of_sigma), int(of_seg), tuple(src_list))
+                    if st.button("Recover orientation field", type="primary",
+                                 disabled="of_job" in st.session_state, key="of_btn"):
+                        sel = np.linspace(0, len(src_list) - 1, of_tx).astype(int)
+                        st.session_state.of_job = dict(
+                            sig=_of_sig, t0=time.time(), evals=0, est=of_est,
+                            tx_sel=[int(i) for i in dict.fromkeys(sel)],
+                            phase="init", blab=_blab, nb=_nb,
+                            baxes=np.tile([0.0, 0.0, 1.0], (_nb, 1)),
+                            best_j=None, best_a=None, blk=0, diri=0,
+                            colat=None, azim=None, it=0, txi=0, Jacc=0.0,
+                            gt=None, gp=None, hist=[], srate=0.3,
+                            bJ=None, bcolat=None, bazim=None, bgt=None, bgp=None,
+                            seg=None, seg_ids=None, seg_i=0, seg_d=0,
+                            sbj=None, sbd=None, round2=False)
+                        st.session_state.pop("of_result", None)
+                        st.rerun()
+
+                    ojob = st.session_state.get("of_job")
+                    if ojob is not None and ojob["sig"] != _of_sig:
+                        del st.session_state.of_job
+                        js_progress(done=True)
+                        st.warning("Configuration changed during the orientation-field "
+                                   "inversion; run aborted.")
+                        ojob = None
+                    if ojob is not None:
+                        ds = st.session_state.ds
+                        src_sub = [src_list[i] for i in ojob["tx_sel"]]
+                        dobs_sub = ds.data[ojob["tx_sel"]]
+                        base6 = anisotropy.ti_stiffness_6(**material)
+                        K_bg = 1000.0 * 1480.0 ** 2
+                        Cbg = {k: np.full((n, n, n),
+                                          K_bg if (int(k[1]) <= 3 and int(k[2]) <= 3)
+                                          else 0.0)
+                               for k in axisfield.KEYS21}
+                        # per-trace normalisation, self-trace excluded (the COF misfit)
+                        _trn = np.sqrt(np.sum(dobs_sub ** 2, axis=1)) + 1e-30
+                        _wtr = np.ones_like(_trn)
+                        for _i, _s in enumerate(src_sub):
+                            _wtr[_i, _s] = 0.0
+                        tw_list = [(_wtr / _trn)[_i] for _i in range(len(src_sub))]
+
+                        frac = ojob["evals"] / max(ojob["est"], 1)
+                        el = time.time() - ojob["t0"]
+                        eta = el / max(ojob["evals"], 1) * max(ojob["est"] - ojob["evals"], 0)
+                        msg = (f"Orientation field [{ojob['phase']}]: evaluation "
+                               f"{ojob['evals'] + 1}/~{ojob['est']}"
+                               + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
+                                  if ojob["evals"] else " ..."))
+                        js_progress(min(frac, 1.0), msg)
+                        if not IN_BROWSER:
+                            st.progress(min(frac, 1.0), text=msg)
+
+                        hemi = [d if d[2] >= 0 else -d
+                                for d in _fibonacci_directions(of_dirs,
+                                                               hemisphere=True)]
+                        rec_grp_all = [([idx], [1.0]) for idx in ring.idx]
+                        src_pts_all = [[(ring.element_index(s), 1.0)]
+                                       for s in src_sub]
+
+                        def _field_J(cl, az):
+                            return axisfield.field_misfit(
+                                cl, az, of_mask, base6, Cbg, 1000.0, material["rho"],
+                                h, dt, nt, src_pts_all, wavelet_eff, rec_grp_all,
+                                dobs_sub, trace_weights=tw_list, device="auto")
+
+                        def _enter_second_descent():
+                            ojob["round2"] = True
+                            ojob["colat"] = ojob["bcolat"].copy()
+                            ojob["azim"] = ojob["bazim"].copy()
+                            ojob["bJ"] = None       # fresh guard, field is the best
+                            ojob["bgt"] = ojob["bgp"] = None
+                            ojob["it"] = 0
+                            ojob["srate"] = 0.3
+                            ojob["phase"] = "voxel"
+                            return of_iters == 0    # nothing left to run
+
+                        done = False
+                        if ojob["phase"] in ("init", "coarse"):
+                            residual = cof.make_residual(
+                                ojob["blab"], ring, h, dt, nt, wavelet, src_sub,
+                                dobs_sub, material=material,
+                                filter_fn=lambda d: apply_rx_filter(d, axis=1))
+
+                            def Jof(bax):
+                                r_ = residual(cof.params_from_axes(bax))
+                                return 0.5 * float(r_ @ r_)
+
+                            if ojob["phase"] == "init":
+                                J0 = Jof(ojob["baxes"])
+                                ojob["hist"].append(J0)
+                                ojob["best_j"] = J0
+                                ojob["best_a"] = ojob["baxes"][0].copy()
+                                ojob["phase"] = "coarse"
+                            else:
+                                b_i, d_i = ojob["blk"], ojob["diri"]
+                                bax_try = ojob["baxes"].copy()
+                                bax_try[b_i] = hemi[d_i]
+                                Jt = Jof(bax_try)
+                                if Jt < ojob["best_j"]:
+                                    ojob["best_j"] = Jt
+                                    ojob["best_a"] = np.array(hemi[d_i])
+                                ojob["diri"] += 1
+                                if ojob["diri"] >= of_dirs:
+                                    ojob["baxes"][b_i] = ojob["best_a"]
+                                    ojob["hist"].append(ojob["best_j"])
+                                    ojob["diri"] = 0
+                                    ojob["blk"] += 1
+                                    if ojob["blk"] >= ojob["nb"]:
+                                        ojob["colat"], ojob["azim"] = \
+                                            axisfield.axes_to_field(
+                                                ojob["blab"], ojob["baxes"], of_mask)
+                                        ojob["phase"] = "voxel"
+                                        if of_iters == 0:
+                                            if of_seg > 0:
+                                                ojob["phase"] = "segment"
+                                            else:
+                                                done = True
+                                    else:
+                                        ojob["best_j"] = ojob["hist"][-1]
+                                        ojob["best_a"] = \
+                                            ojob["baxes"][ojob["blk"]].copy()
+                        elif ojob["phase"] == "segment":
+                            # cluster the current best field into emergent grains
+                            if ojob["bcolat"] is None:      # straight from coarse
+                                ojob["bcolat"] = ojob["colat"].copy()
+                                ojob["bazim"] = ojob["azim"].copy()
+                            if ojob["bJ"] is None:
+                                ojob["bJ"] = _field_J(ojob["bcolat"], ojob["bazim"])
+                            seg, sizes, order = axisfield.segment_field(
+                                ojob["bcolat"], ojob["bazim"], of_mask, n_clusters=8)
+                            ojob["seg"] = seg
+                            ojob["seg_ids"] = [i for i in order
+                                               if sizes[i] >= 8][:of_seg]
+                            ojob["seg_i"] = 0; ojob["seg_d"] = 0
+                            ojob["sbj"] = ojob["bJ"]; ojob["sbd"] = None
+                            if ojob["seg_ids"]:
+                                ojob["phase"] = "research"
+                            else:
+                                done = _enter_second_descent()
+                        elif ojob["phase"] == "research":
+                            # global hemisphere re-search of one segment, greedy
+                            sid = ojob["seg_ids"][ojob["seg_i"]]
+                            d = hemi[ojob["seg_d"]]
+                            c_t, a_t = axisfield.set_segment_axis(
+                                ojob["bcolat"], ojob["bazim"], ojob["seg"], sid, d)
+                            Jt = _field_J(c_t, a_t)
+                            if Jt < ojob["sbj"] * (1 - 1e-3):
+                                ojob["sbj"] = Jt
+                                ojob["sbd"] = np.array(d)
+                            ojob["seg_d"] += 1
+                            if ojob["seg_d"] >= of_dirs:
+                                if ojob["sbd"] is not None:     # segment improved
+                                    ojob["bcolat"], ojob["bazim"] = \
+                                        axisfield.set_segment_axis(
+                                            ojob["bcolat"], ojob["bazim"],
+                                            ojob["seg"], sid, ojob["sbd"])
+                                    ojob["bJ"] = ojob["sbj"]
+                                    ojob["hist"].append(ojob["bJ"])
+                                ojob["seg_d"] = 0; ojob["sbd"] = None
+                                ojob["seg_i"] += 1
+                                ojob["sbj"] = ojob["bJ"]
+                                if ojob["seg_i"] >= len(ojob["seg_ids"]):
+                                    done = _enter_second_descent()
+                        else:                                   # voxel descent, one tx
+                            i_tx = ojob["txi"]
+                            src_pts_1 = [[(ring.element_index(src_sub[i_tx]), 1.0)]]
+                            rec_grp = [([idx], [1.0]) for idx in ring.idx]
+                            J1, g_t, g_p = axisfield.misfit_and_gradient_axes(
+                                ojob["colat"], ojob["azim"], of_mask, base6, Cbg,
+                                1000.0, material["rho"], h, dt, nt, src_pts_1,
+                                wavelet_eff, rec_grp, dobs_sub[i_tx:i_tx + 1],
+                                trace_weights=tw_list[i_tx])
+                            ojob["Jacc"] += J1
+                            ojob["gt"] = g_t if ojob["gt"] is None else ojob["gt"] + g_t
+                            ojob["gp"] = g_p if ojob["gp"] is None else ojob["gp"] + g_p
+                            ojob["txi"] += 1
+                            if ojob["txi"] >= len(src_sub):
+                                ojob["hist"].append(ojob["Jacc"])
+                                # monotone guard: an uphill iteration is rejected --
+                                # revert to the best field and halve the step.
+                                if ojob["bJ"] is None or ojob["Jacc"] < ojob["bJ"]:
+                                    ojob["bJ"] = ojob["Jacc"]
+                                    ojob["bcolat"] = ojob["colat"].copy()
+                                    ojob["bazim"] = ojob["azim"].copy()
+                                    ojob["bgt"], ojob["bgp"] = ojob["gt"], ojob["gp"]
+                                else:
+                                    ojob["srate"] *= 0.5
+                                    ojob["colat"] = ojob["bcolat"].copy()
+                                    ojob["azim"] = ojob["bazim"].copy()
+                                    ojob["gt"], ojob["gp"] = ojob["bgt"], ojob["bgp"]
+                                ojob["colat"], ojob["azim"] = axisfield.gradient_step(
+                                    ojob["colat"], ojob["azim"], of_mask,
+                                    ojob["gt"], ojob["gp"], step_rad=ojob["srate"],
+                                    smooth_sigma=of_sigma)
+                                ojob["txi"] = 0; ojob["Jacc"] = 0.0
+                                ojob["gt"] = None; ojob["gp"] = None
+                                ojob["it"] += 1
+                                if ojob["it"] >= of_iters:
+                                    if of_seg > 0 and not ojob["round2"]:
                                         ojob["phase"] = "segment"
                                     else:
                                         done = True
-                            else:
-                                ojob["best_j"] = ojob["hist"][-1]
-                                ojob["best_a"] = \
-                                    ojob["baxes"][ojob["blk"]].copy()
-                elif ojob["phase"] == "segment":
-                    # cluster the current best field into emergent grains
-                    if ojob["bcolat"] is None:      # straight from coarse
-                        ojob["bcolat"] = ojob["colat"].copy()
-                        ojob["bazim"] = ojob["azim"].copy()
-                    if ojob["bJ"] is None:
-                        ojob["bJ"] = _field_J(ojob["bcolat"], ojob["bazim"])
-                    seg, sizes, order = axisfield.segment_field(
-                        ojob["bcolat"], ojob["bazim"], of_mask, n_clusters=8)
-                    ojob["seg"] = seg
-                    ojob["seg_ids"] = [i for i in order
-                                       if sizes[i] >= 8][:of_seg]
-                    ojob["seg_i"] = 0; ojob["seg_d"] = 0
-                    ojob["sbj"] = ojob["bJ"]; ojob["sbd"] = None
-                    if ojob["seg_ids"]:
-                        ojob["phase"] = "research"
-                    else:
-                        done = _enter_second_descent()
-                elif ojob["phase"] == "research":
-                    # global hemisphere re-search of one segment, greedy
-                    sid = ojob["seg_ids"][ojob["seg_i"]]
-                    d = hemi[ojob["seg_d"]]
-                    c_t, a_t = axisfield.set_segment_axis(
-                        ojob["bcolat"], ojob["bazim"], ojob["seg"], sid, d)
-                    Jt = _field_J(c_t, a_t)
-                    if Jt < ojob["sbj"] * (1 - 1e-3):
-                        ojob["sbj"] = Jt
-                        ojob["sbd"] = np.array(d)
-                    ojob["seg_d"] += 1
-                    if ojob["seg_d"] >= of_dirs:
-                        if ojob["sbd"] is not None:     # segment improved
-                            ojob["bcolat"], ojob["bazim"] = \
-                                axisfield.set_segment_axis(
-                                    ojob["bcolat"], ojob["bazim"],
-                                    ojob["seg"], sid, ojob["sbd"])
-                            ojob["bJ"] = ojob["sbj"]
-                            ojob["hist"].append(ojob["bJ"])
-                        ojob["seg_d"] = 0; ojob["sbd"] = None
-                        ojob["seg_i"] += 1
-                        ojob["sbj"] = ojob["bJ"]
-                        if ojob["seg_i"] >= len(ojob["seg_ids"]):
-                            done = _enter_second_descent()
-                else:                                   # voxel descent, one tx
-                    i_tx = ojob["txi"]
-                    src_pts_1 = [[(ring.element_index(src_sub[i_tx]), 1.0)]]
-                    rec_grp = [([idx], [1.0]) for idx in ring.idx]
-                    J1, g_t, g_p = axisfield.misfit_and_gradient_axes(
-                        ojob["colat"], ojob["azim"], of_mask, base6, Cbg,
-                        1000.0, material["rho"], h, dt, nt, src_pts_1,
-                        wavelet_eff, rec_grp, dobs_sub[i_tx:i_tx + 1],
-                        trace_weights=tw_list[i_tx])
-                    ojob["Jacc"] += J1
-                    ojob["gt"] = g_t if ojob["gt"] is None else ojob["gt"] + g_t
-                    ojob["gp"] = g_p if ojob["gp"] is None else ojob["gp"] + g_p
-                    ojob["txi"] += 1
-                    if ojob["txi"] >= len(src_sub):
-                        ojob["hist"].append(ojob["Jacc"])
-                        # monotone guard: an uphill iteration is rejected --
-                        # revert to the best field and halve the step.
-                        if ojob["bJ"] is None or ojob["Jacc"] < ojob["bJ"]:
-                            ojob["bJ"] = ojob["Jacc"]
-                            ojob["bcolat"] = ojob["colat"].copy()
-                            ojob["bazim"] = ojob["azim"].copy()
-                            ojob["bgt"], ojob["bgp"] = ojob["gt"], ojob["gp"]
+                        ojob["evals"] += 1
+                        if not done:
+                            st.rerun()
+                        js_progress(done=True)
+                        # best evaluated iterate (the final step is never evaluated)
+                        fin_colat = (ojob["bcolat"] if ojob["bcolat"] is not None
+                                     else ojob["colat"])
+                        fin_azim = (ojob["bazim"] if ojob["bazim"] is not None
+                                    else ojob["azim"])
+                        true_ax_map = np.zeros(of_mask.shape + (3,))
+                        for _k in range(len(axes3)):
+                            true_ax_map[labels == _k] = axes3[_k]
+                        errm = axisfield.axis_error_map(fin_colat, fin_azim,
+                                                        true_ax_map, of_mask)
+                        mean_e = float(errm[of_mask].mean())
+                        max_e = float(errm[of_mask].max())
+                        _nanout = lambda v: np.where(of_mask, v, np.nan)
+                        colat_true_map = _nanout(np.degrees(np.arccos(np.clip(
+                            np.abs(true_ax_map[..., 2]), 0.0, 1.0))))
+                        a_rec = axisfield.field_to_axes(fin_colat, fin_azim)
+                        colat_rec_map = _nanout(np.degrees(np.arccos(np.clip(
+                            np.abs(a_rec[..., 2]), 0.0, 1.0))))
+                        st.session_state.of_result = dict(
+                            colat_true=colat_true_map, colat_rec=colat_rec_map,
+                            err=_nanout(errm), mean_err=mean_e, max_err=max_e,
+                            hist=list(ojob["hist"]), evals=ojob["evals"],
+                            secs=time.time() - ojob["t0"])
+                        del st.session_state.of_job
+
+                    ores = st.session_state.get("of_result")
+                    if ores is not None:
+                        import plotly.graph_objects as go
+                        from plotly.subplots import make_subplots
+                        st.success(f"Orientation field recovered with no geometry "
+                                   f"prior in {ores['evals']} evaluations "
+                                   f"({hms(ores['secs'])}): mean axis error "
+                                   f"{ores['mean_err']:.1f} deg, "
+                                   f"max {ores['max_err']:.1f} deg")
+                        mmv = np.arange(n) * h * 1e3
+
+                        def of_volume(vol, title, cmax, scale, isomin=0.0, op=0.12):
+                            # exterior NaN -> far below isomin, so it renders as void
+                            v = np.nan_to_num(vol, nan=-1e3)
+                            zc, yc, xc = np.meshgrid(mmv, mmv, mmv, indexing="ij")
+                            fig = go.Figure(go.Volume(
+                                x=xc.ravel(), y=yc.ravel(), z=zc.ravel(),
+                                value=v.ravel(), isomin=isomin, isomax=cmax,
+                                opacity=op, surface_count=17, colorscale=scale,
+                                colorbar=dict(title="deg"),
+                                caps=dict(x_show=False, y_show=False, z_show=False)))
+                            fig.add_trace(go.Scatter3d(
+                                x=elem_abs[:, 0] * 1e3, y=elem_abs[:, 1] * 1e3,
+                                z=elem_abs[:, 2] * 1e3, mode="markers",
+                                marker=dict(size=3, color="#00e5ff"),
+                                showlegend=False, hoverinfo="skip"))
+                            fig.update_layout(
+                                title=title, height=430,
+                                margin=dict(l=0, r=0, t=40, b=0),
+                                scene=dict(xaxis_title="x (mm)", yaxis_title="y (mm)",
+                                           zaxis_title="z (mm)"))
+                            return fig
+
+                        ofa, ofb = st.columns(2)
+                        with ofa:
+                            st.plotly_chart(of_volume(ores["colat_true"],
+                                                      "True c-axis colatitude", 90,
+                                                      "Twilight"), width="stretch")
+                        with ofb:
+                            st.plotly_chart(of_volume(ores["colat_rec"],
+                                                      "Recovered colatitude (grains "
+                                                      "emerge, no labels given)", 90,
+                                                      "Twilight"), width="stretch")
+                        st.plotly_chart(of_volume(ores["err"],
+                                                  "Axis error (only regions above "
+                                                  "5 deg shown)", 45, "Inferno",
+                                                  isomin=5.0, op=0.15),
+                                        width="stretch")
+                        st.caption("Rotate and zoom; colour follows colatitude / "
+                                   "error, the couplant is invisible. The error "
+                                   "volume shows only where the recovered axis is "
+                                   "more than 5 deg wrong, so a correct inversion "
+                                   "is an empty box.")
+                        fo = go.Figure(go.Scatter(y=ores["hist"],
+                                                  mode="lines+markers"))
+                        fo.update_yaxes(type="log", title="misfit")
+                        fo.update_layout(title="Orientation-field convergence "
+                                               "(coarse then voxel stages)",
+                                         xaxis_title="accepted update", height=260,
+                                         margin=dict(l=10, r=10, t=40, b=10))
+                        st.plotly_chart(fo, width="stretch")
+
+                with tab_vs:
+                    st.subheader("Voronoi-seed inversion (unknown geometry, "
+                                 "parametric)")
+                    st.caption("The literature answer to the voxel null space "
+                               "(transdimensional Voronoi tomography; parametric "
+                               "level-set FWI): the unknown geometry is itself a "
+                               "low-dimensional parameter -- one Voronoi seed and one "
+                               "c-axis per grain, five unknowns each. Simulated "
+                               "annealing over seeds and axes does the basin-hopping "
+                               "(uphill moves accepted under a cooling temperature, "
+                               "as in the stochastic literature methods), then joint "
+                               "Levenberg-Marquardt and an angle-only polish on the "
+                               "recovered hard geometry.")
+                    vs1, vs2, vs3, vs4 = st.columns(4)
+                    with vs1:
+                        vs_tx = st.slider("Transmits ", 2, len(src_list),
+                                          min(4, len(src_list)), key="vs_tx")
+                    with vs2:
+                        vs_g = st.slider("Grains (seeds)", 2, 10, 6, key="vs_g",
+                                         help="Number of Voronoi cells to invert. "
+                                              "Need not match the truth exactly; "
+                                              "extra cells can share an axis.")
+                    with vs3:
+                        vs_sa = st.slider("Annealing steps", 0, 4000, 600, 100,
+                                          key="vs_sa",
+                                          help="Metropolis moves over seeds and axes "
+                                               "with geometric cooling; the stage "
+                                               "that escapes false basins. One "
+                                               "forward evaluation per step.")
+                    with vs4:
+                        vs_lm = st.slider("LM iterations", 0, 6, 3, key="vs_lm")
+                    vs_est = (1 + vs_sa + vs_lm * (5 * vs_g + 3)
+                              + 2 * (2 * vs_g + 3))
+                    st.caption(f"About {vs_est} forward evaluations of {vs_tx} "
+                               f"transmits ({5 * vs_g} unknowns: seed xyz + 2 "
+                               f"angles per grain).")
+
+                    progress_widget()
+                    _vs_sig = (n, nt, int(seed), vs_tx, vs_g, vs_sa,
+                               vs_lm, tuple(src_list))
+                    if st.button("Recover grains (seeds + axes)", type="primary",
+                                 disabled="vs_job" in st.session_state, key="vs_btn"):
+                        sel = np.linspace(0, len(src_list) - 1, vs_tx).astype(int)
+                        st.session_state.vs_job = dict(
+                            sig=_vs_sig, t0=time.time(), evals=0, est=vs_est,
+                            tx_sel=[int(i) for i in dict.fromkeys(sel)],
+                            phase="init", k=0, J0=None, Jc=None,
+                            rng=np.random.default_rng(int(seed) + 1),
+                            seeds=None, axes=np.tile([0.0, 0.0, 1.0], (vs_g, 1)),
+                            bseeds=None, baxes=None, bJ=None, hist=[],
+                            lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
+                                    J=None, Jac=None, col=0, trial=0),
+                            polish=False)
+                        st.session_state.pop("vs_result", None)
+                        st.rerun()
+
+                    vjob = st.session_state.get("vs_job")
+                    if vjob is not None and vjob["sig"] != _vs_sig:
+                        del st.session_state.vs_job
+                        js_progress(done=True)
+                        st.warning("Configuration changed during the Voronoi-seed "
+                                   "inversion; run aborted.")
+                        vjob = None
+                    if vjob is not None:
+                        from ringfwi import voronoi_inv as vi
+                        ds = st.session_state.ds
+                        src_sub = [src_list[i] for i in vjob["tx_sel"]]
+                        dobs_sub = ds.data[vjob["tx_sel"]]
+                        vs_mask = labels >= 0
+                        if vjob["seeds"] is None:
+                            vjob["seeds"] = vi.kmeans_seeds(vs_mask, h, vs_g,
+                                                            seed=int(seed))
+                        if vjob["polish"]:
+                            lab_now = vi.hard_labels(vjob["seeds"], vs_mask, h)
+                            res_fn = cof.make_residual(
+                                lab_now, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
+                                material=material,
+                                filter_fn=lambda d: apply_rx_filter(d, axis=1))
                         else:
-                            ojob["srate"] *= 0.5
-                            ojob["colat"] = ojob["bcolat"].copy()
-                            ojob["azim"] = ojob["bazim"].copy()
-                            ojob["gt"], ojob["gp"] = ojob["bgt"], ojob["bgp"]
-                        ojob["colat"], ojob["azim"] = axisfield.gradient_step(
-                            ojob["colat"], ojob["azim"], of_mask,
-                            ojob["gt"], ojob["gp"], step_rad=ojob["srate"],
-                            smooth_sigma=of_sigma)
-                        ojob["txi"] = 0; ojob["Jacc"] = 0.0
-                        ojob["gt"] = None; ojob["gp"] = None
-                        ojob["it"] += 1
-                        if ojob["it"] >= of_iters:
-                            if of_seg > 0 and not ojob["round2"]:
-                                ojob["phase"] = "segment"
-                            else:
-                                done = True
-                ojob["evals"] += 1
-                if not done:
-                    st.rerun()
-                js_progress(done=True)
-                # best evaluated iterate (the final step is never evaluated)
-                fin_colat = (ojob["bcolat"] if ojob["bcolat"] is not None
-                             else ojob["colat"])
-                fin_azim = (ojob["bazim"] if ojob["bazim"] is not None
-                            else ojob["azim"])
-                true_ax_map = np.zeros(of_mask.shape + (3,))
-                for _k in range(len(axes3)):
-                    true_ax_map[labels == _k] = axes3[_k]
-                errm = axisfield.axis_error_map(fin_colat, fin_azim,
-                                                true_ax_map, of_mask)
-                mean_e = float(errm[of_mask].mean())
-                max_e = float(errm[of_mask].max())
-                _nanout = lambda v: np.where(of_mask, v, np.nan)
-                colat_true_map = _nanout(np.degrees(np.arccos(np.clip(
-                    np.abs(true_ax_map[..., 2]), 0.0, 1.0))))
-                a_rec = axisfield.field_to_axes(fin_colat, fin_azim)
-                colat_rec_map = _nanout(np.degrees(np.arccos(np.clip(
-                    np.abs(a_rec[..., 2]), 0.0, 1.0))))
-                st.session_state.of_result = dict(
-                    colat_true=colat_true_map, colat_rec=colat_rec_map,
-                    err=_nanout(errm), mean_err=mean_e, max_err=max_e,
-                    hist=list(ojob["hist"]), evals=ojob["evals"],
-                    secs=time.time() - ojob["t0"])
-                del st.session_state.of_job
+                            lab_now = None
+                            res_fn = vi.make_residual_seeds(
+                                vs_mask, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
+                                material=material,
+                                filter_fn=lambda d: apply_rx_filter(d, axis=1))
 
-            ores = st.session_state.get("of_result")
-            if ores is not None:
-                import plotly.graph_objects as go
-                from plotly.subplots import make_subplots
-                st.success(f"Orientation field recovered with no geometry "
-                           f"prior in {ores['evals']} evaluations "
-                           f"({hms(ores['secs'])}): mean axis error "
-                           f"{ores['mean_err']:.1f} deg, "
-                           f"max {ores['max_err']:.1f} deg")
-                mmv = np.arange(n) * h * 1e3
+                        # --- evaluation backend: CPU (sync) or client GPU (async) ---
+                        use_wgpu = (IN_BROWSER and not vjob.get("wgpu_failed")
+                                    and webgpu_elastic.available())
+                        _spa = [[(ring.element_index(s), 1.0)] for s in src_sub]
+                        _vtrn = np.sqrt(np.sum(dobs_sub ** 2, axis=1)) + 1e-30
+                        _vwtr = np.ones_like(_vtrn)
+                        for _i, _s in enumerate(src_sub):
+                            _vwtr[_i, _s] = 0.0
+                        _vs_base6 = anisotropy.ti_stiffness_6(**material)
+                        _vKbg = 1000.0 * 1480.0 ** 2
+                        _vs_Cbg = {k: np.full((n, n, n),
+                                              _vKbg if (int(k[1]) <= 3
+                                                        and int(k[2]) <= 3) else 0.0)
+                                   for k in vi._KEYS21}
 
-                def of_volume(vol, title, cmax, scale, isomin=0.0, op=0.12):
-                    # exterior NaN -> far below isomin, so it renders as void
-                    v = np.nan_to_num(vol, nan=-1e3)
-                    zc, yc, xc = np.meshgrid(mmv, mmv, mmv, indexing="ij")
-                    fig = go.Figure(go.Volume(
-                        x=xc.ravel(), y=yc.ravel(), z=zc.ravel(),
-                        value=v.ravel(), isomin=isomin, isomax=cmax,
-                        opacity=op, surface_count=17, colorscale=scale,
-                        colorbar=dict(title="deg"),
-                        caps=dict(x_show=False, y_show=False, z_show=False)))
-                    fig.add_trace(go.Scatter3d(
-                        x=elem_abs[:, 0] * 1e3, y=elem_abs[:, 1] * 1e3,
-                        z=elem_abs[:, 2] * 1e3, mode="markers",
-                        marker=dict(size=3, color="#00e5ff"),
-                        showlegend=False, hoverinfo="skip"))
-                    fig.update_layout(
-                        title=title, height=430,
-                        margin=dict(l=0, r=0, t=40, b=0),
-                        scene=dict(xaxis_title="x (mm)", yaxis_title="y (mm)",
-                                   zaxis_title="z (mm)"))
-                    return fig
+                        def _v_maps(p_):
+                            if vjob["polish"]:
+                                axes_p = cof.axes_from_params(
+                                    np.asarray(p_).reshape(-1, 2))
+                                return anisotropy.polycrystal_stiffness_3d(
+                                    lab_now, axes_p, material=material)
+                            seeds_p, axes_p = vi.params_unpack(np.asarray(p_).ravel())
+                            return vi.blended_maps(seeds_p, axes_p, vs_mask, h,
+                                                   _vs_base6, _vs_Cbg, 1000.0,
+                                                   material["rho"])
 
-                ofa, ofb = st.columns(2)
-                with ofa:
-                    st.plotly_chart(of_volume(ores["colat_true"],
-                                              "True c-axis colatitude", 90,
-                                              "Twilight"), width="stretch")
-                with ofb:
-                    st.plotly_chart(of_volume(ores["colat_rec"],
-                                              "Recovered colatitude (grains "
-                                              "emerge, no labels given)", 90,
-                                              "Twilight"), width="stretch")
-                st.plotly_chart(of_volume(ores["err"],
-                                          "Axis error (only regions above "
-                                          "5 deg shown)", 45, "Inferno",
-                                          isomin=5.0, op=0.15),
-                                width="stretch")
-                st.caption("Rotate and zoom; colour follows colatitude / "
-                           "error, the couplant is invisible. The error "
-                           "volume shows only where the recovered axis is "
-                           "more than 5 deg wrong, so a correct inversion "
-                           "is an empty box.")
-                fo = go.Figure(go.Scatter(y=ores["hist"],
-                                          mode="lines+markers"))
-                fo.update_yaxes(type="log", title="misfit")
-                fo.update_layout(title="Orientation-field convergence "
-                                       "(coarse then voxel stages)",
-                                 xaxis_title="accepted update", height=260,
-                                 margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fo, width="stretch")
+                        def _v_res_from_traces(d):
+                            d = apply_rx_filter(d, axis=1)
+                            return ((d - dobs_sub)
+                                    * (_vwtr / _vtrn)[:, None, :]).ravel()
 
-            st.divider()
-            st.subheader("Voronoi-seed inversion (unknown geometry, "
-                         "parametric)")
-            st.caption("The literature answer to the voxel null space "
-                       "(transdimensional Voronoi tomography; parametric "
-                       "level-set FWI): the unknown geometry is itself a "
-                       "low-dimensional parameter -- one Voronoi seed and one "
-                       "c-axis per grain, five unknowns each. Simulated "
-                       "annealing over seeds and axes does the basin-hopping "
-                       "(uphill moves accepted under a cooling temperature, "
-                       "as in the stochastic literature methods), then joint "
-                       "Levenberg-Marquardt and an angle-only polish on the "
-                       "recovered hard geometry.")
-            vs1, vs2, vs3, vs4 = st.columns(4)
-            with vs1:
-                vs_tx = st.slider("Transmits ", 2, len(src_list),
-                                  min(4, len(src_list)), key="vs_tx")
-            with vs2:
-                vs_g = st.slider("Grains (seeds)", 2, 10, 6, key="vs_g",
-                                 help="Number of Voronoi cells to invert. "
-                                      "Need not match the truth exactly; "
-                                      "extra cells can share an axis.")
-            with vs3:
-                vs_sa = st.slider("Annealing steps", 0, 4000, 600, 100,
-                                  key="vs_sa",
-                                  help="Metropolis moves over seeds and axes "
-                                       "with geometric cooling; the stage "
-                                       "that escapes false basins. One "
-                                       "forward evaluation per step.")
-            with vs4:
-                vs_lm = st.slider("LM iterations", 0, 6, 3, key="vs_lm")
-            vs_est = (1 + vs_sa + vs_lm * (5 * vs_g + 3)
-                      + 2 * (2 * vs_g + 3))
-            st.caption(f"About {vs_est} forward evaluations of {vs_tx} "
-                       f"transmits ({5 * vs_g} unknowns: seed xyz + 2 "
-                       f"angles per grain).")
+                        class _PendingEval(Exception):
+                            pass
 
-            progress_widget()
-            _vs_sig = (n, nt, int(seed), vs_tx, vs_g, vs_sa,
-                       vs_lm, tuple(src_list))
-            if st.button("Recover grains (seeds + axes)", type="primary",
-                         disabled="vs_job" in st.session_state, key="vs_btn"):
-                sel = np.linspace(0, len(src_list) - 1, vs_tx).astype(int)
-                st.session_state.vs_job = dict(
-                    sig=_vs_sig, t0=time.time(), evals=0, est=vs_est,
-                    tx_sel=[int(i) for i in dict.fromkeys(sel)],
-                    phase="init", k=0, J0=None, Jc=None,
-                    rng=np.random.default_rng(int(seed) + 1),
-                    seeds=None, axes=np.tile([0.0, 0.0, 1.0], (vs_g, 1)),
-                    bseeds=None, baxes=None, bJ=None, hist=[],
-                    lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
-                            J=None, Jac=None, col=0, trial=0),
-                    polish=False)
-                st.session_state.pop("vs_result", None)
-                st.rerun()
-
-            vjob = st.session_state.get("vs_job")
-            if vjob is not None and vjob["sig"] != _vs_sig:
-                del st.session_state.vs_job
-                js_progress(done=True)
-                st.warning("Configuration changed during the Voronoi-seed "
-                           "inversion; run aborted.")
-                vjob = None
-            if vjob is not None:
-                from ringfwi import voronoi_inv as vi
-                ds = st.session_state.ds
-                src_sub = [src_list[i] for i in vjob["tx_sel"]]
-                dobs_sub = ds.data[vjob["tx_sel"]]
-                vs_mask = labels >= 0
-                if vjob["seeds"] is None:
-                    vjob["seeds"] = vi.kmeans_seeds(vs_mask, h, vs_g,
-                                                    seed=int(seed))
-                if vjob["polish"]:
-                    lab_now = vi.hard_labels(vjob["seeds"], vs_mask, h)
-                    res_fn = cof.make_residual(
-                        lab_now, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
-                        material=material,
-                        filter_fn=lambda d: apply_rx_filter(d, axis=1))
-                else:
-                    lab_now = None
-                    res_fn = vi.make_residual_seeds(
-                        vs_mask, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
-                        material=material,
-                        filter_fn=lambda d: apply_rx_filter(d, axis=1))
-
-                # --- evaluation backend: CPU (sync) or client GPU (async) ---
-                use_wgpu = (IN_BROWSER and not vjob.get("wgpu_failed")
-                            and webgpu_elastic.available())
-                _spa = [[(ring.element_index(s), 1.0)] for s in src_sub]
-                _vtrn = np.sqrt(np.sum(dobs_sub ** 2, axis=1)) + 1e-30
-                _vwtr = np.ones_like(_vtrn)
-                for _i, _s in enumerate(src_sub):
-                    _vwtr[_i, _s] = 0.0
-                _vs_base6 = anisotropy.ti_stiffness_6(**material)
-                _vKbg = 1000.0 * 1480.0 ** 2
-                _vs_Cbg = {k: np.full((n, n, n),
-                                      _vKbg if (int(k[1]) <= 3
-                                                and int(k[2]) <= 3) else 0.0)
-                           for k in vi._KEYS21}
-
-                def _v_maps(p_):
-                    if vjob["polish"]:
-                        axes_p = cof.axes_from_params(
-                            np.asarray(p_).reshape(-1, 2))
-                        return anisotropy.polycrystal_stiffness_3d(
-                            lab_now, axes_p, material=material)
-                    seeds_p, axes_p = vi.params_unpack(np.asarray(p_).ravel())
-                    return vi.blended_maps(seeds_p, axes_p, vs_mask, h,
-                                           _vs_base6, _vs_Cbg, 1000.0,
-                                           material["rho"])
-
-                def _v_res_from_traces(d):
-                    d = apply_rx_filter(d, axis=1)
-                    return ((d - dobs_sub)
-                            * (_vwtr / _vtrn)[:, None, :]).ravel()
-
-                class _PendingEval(Exception):
-                    pass
-
-                # advance a pending GPU evaluation before the phase logic
-                _pend = vjob.get("pend")
-                if use_wgpu and _pend is not None and _pend.get("r") is None:
-                    _stat = webgpu_elastic.poll(_pend["id"])
-                    if (_stat["prog"] == 0 and not _stat["done"]
-                            and time.time() - _pend["t0"] > 25):
-                        vjob["wgpu_reason"] = "eval start timeout (25 s)"
-                        st.warning("Client GPU did not start within 25 s; "
-                                   "using CPU for this inversion.")
-                        vjob["wgpu_failed"] = True
-                        vjob["pend"] = None
-                        st.rerun()
-                    if _stat["error"]:
-                        vjob["wgpu_reason"] = f"eval error: {_stat['error']}"
-                        st.warning(f"Client GPU (elastic) failed "
-                                   f"({_stat['error']}); using CPU.")
-                        vjob["wgpu_failed"] = True
-                        vjob["pend"] = None
-                        st.rerun()
-                    elif not _stat["done"]:
-                        js_progress(min(vjob["evals"] / max(vjob["est"], 1),
-                                        1.0),
-                                    f"Voronoi evaluation "
-                                    f"{vjob['evals'] + 1}/~{vjob['est']} on "
-                                    f"YOUR GPU (WebGPU): step "
-                                    f"{_stat['prog']}/{_stat['total']}")
-                        st.rerun()
-                    else:
-                        _d = webgpu_elastic.result(_pend["id"], len(src_sub),
-                                                   nt, len(ring.idx))
-                        _rg = _v_res_from_traces(_d)
-                        if not vjob.get("wgpu_checked"):
-                            js_progress(0.05, "First GPU evaluation done; "
-                                              "verifying one transmit on the "
-                                              "CPU (one-off parity check) ...")
-                            _pp = np.frombuffer(_pend["key"], dtype=float)
-                            _Cm0, _rho0 = _v_maps(_pp)
-                            _ref0, _ = elastic3d.forward(
-                                _Cm0, _rho0, h, dt, nt,
-                                ring.element_index(src_sub[0]), wavelet,
-                                ring.idx, source="explosive",
-                                record="pressure", device="cpu")
-                            _rel = (np.max(np.abs(_d[0] - _ref0))
-                                    / (np.max(np.abs(_ref0)) + 1e-30))
-                            if _rel < 5e-3:
-                                vjob["wgpu_checked"] = True
-                                st.caption(f"Client-GPU elastic evaluation "
-                                           f"verified: rel {_rel:.1e}")
-                            else:
-                                vjob["wgpu_reason"] = (
-                                    f"eval parity rel {_rel:.1e}")
-                                st.warning(f"Client-GPU elastic parity failed "
-                                           f"(rel {_rel:.1e}); using CPU.")
+                        # advance a pending GPU evaluation before the phase logic
+                        _pend = vjob.get("pend")
+                        if use_wgpu and _pend is not None and _pend.get("r") is None:
+                            _stat = webgpu_elastic.poll(_pend["id"])
+                            if (_stat["prog"] == 0 and not _stat["done"]
+                                    and time.time() - _pend["t0"] > 25):
+                                vjob["wgpu_reason"] = "eval start timeout (25 s)"
+                                st.warning("Client GPU did not start within 25 s; "
+                                           "using CPU for this inversion.")
                                 vjob["wgpu_failed"] = True
                                 vjob["pend"] = None
                                 st.rerun()
-                        _pend["r"] = _rg
-
-                def vJ(params_flat):
-                    p_ = np.asarray(params_flat, float).ravel()
-                    if use_wgpu:
-                        key = p_.tobytes()
-                        pend = vjob.get("pend")
-                        if (pend is not None and pend["key"] == key
-                                and pend.get("r") is not None):
-                            r_ = pend["r"]
-                            vjob["pend"] = None
-                            return 0.5 * float(r_ @ r_), r_
-                        if pend is None or pend["key"] != key:
-                            Cm_, rho_ = _v_maps(p_)
-                            vjob["pend"] = dict(
-                                key=key, r=None, t0=time.time(),
-                                id=webgpu_elastic.start(
-                                    Cm_, rho_, h, dt, nt, wavelet, _spa,
-                                    ring.idx))
-                        raise _PendingEval()
-                    r_ = res_fn(p_)
-                    return 0.5 * float(r_ @ r_), r_
-
-                if vjob.get("wgpu_reason"):
-                    st.info(f"Running on CPU (GPU fallback: "
-                            f"{vjob['wgpu_reason']})")
-                frac = vjob["evals"] / max(vjob["est"], 1)
-                el = time.time() - vjob["t0"]
-                eta = el / max(vjob["evals"], 1) * max(vjob["est"] - vjob["evals"], 0)
-                _T = (vi.sa_temperature(vjob["k"], max(vs_sa, 1), vjob["J0"])
-                      if vjob["phase"] == "anneal" and vjob["J0"] else None)
-                msg = (f"Voronoi seeds [{vjob['phase']}"
-                       + (f" T={_T:.3g}" if _T is not None else "")
-                       + f"]: evaluation "
-                       f"{vjob['evals'] + 1}/~{vjob['est']}"
-                       + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
-                          if vjob["evals"] else " ..."))
-                js_progress(min(frac, 1.0), msg)
-                if not IN_BROWSER:
-                    st.progress(min(frac, 1.0), text=msg)
-
-                try:
-                    done = False
-                    if vjob["phase"] == "init":
-                        J0, _ = vJ(vi.params_pack(vjob["seeds"], vjob["axes"]))
-                        vjob["J0"] = J0; vjob["Jc"] = J0; vjob["bJ"] = J0
-                        vjob["bseeds"] = vjob["seeds"].copy()
-                        vjob["baxes"] = vjob["axes"].copy()
-                        vjob["hist"].append(J0)
-                        vjob["_pts"] = vi.mask_points(vs_mask, h)
-                        if vs_sa > 0:
-                            vjob["phase"] = "anneal"
-                        else:
-                            vjob["phase"] = "lm"
-                            vjob["lm"]["p"] = vi.params_pack(vjob["seeds"],
-                                                             vjob["axes"])
-                            if vs_lm == 0:
-                                vjob["lm"]["sub"] = "skip"
-                    elif vjob["phase"] == "anneal" and use_wgpu:
-                        # whole annealing loop as ONE main-thread GPU job --
-                        # no per-step rerun tax (the browser speed fix)
-                        if vjob.get("sa_id") is None:
-                            _msk = vs_mask
-                            _K = 1000.0 * 1480.0 ** 2
-                            _mb = np.zeros((22, n * n * n), np.float32)
-                            for _k2, _key in enumerate(vi._KEYS21):
-                                _i2 = int(_key[1]) - 1
-                                _j2 = int(_key[2]) - 1
-                                if _i2 < 3 and _j2 < 3:
-                                    _mb[_k2] = _K
-                            _rhof = np.full((n, n, n), 1000.0, np.float32)
-                            _rhof[_msk] = material["rho"]
-                            _mb[21] = _rhof.ravel()
-                            _x, _y, _z = vi.grid_coords(_msk.shape, h)
-                            _cells = np.flatnonzero(_msk.ravel())
-                            _sos = np.zeros((0, 6))
-                            if rx_filt_on:
-                                from scipy.signal import butter as _butter
-                                _sos = _butter(2, [rx_lo_x * f0, rx_hi_x * f0],
-                                               btype="bandpass", fs=fs,
-                                               output="sos")
-
-                            def _lin3(t):
-                                return (t[0] * n + t[1]) * n + t[2]
-
-                            vjob["sa_id"] = webgpu_elastic.sa_start(
-                                (n, n, n), _mb, _cells,
-                                _x[_msk], _y[_msk], _z[_msk],
-                                anisotropy.ti_stiffness_6(**material),
-                                h, dt, nt, 1.5, wavelet,
-                                [_lin3(ring.element_index(s_))
-                                 for s_ in src_sub],
-                                [_lin3(t_) for t_ in ring.idx],
-                                dobs_sub, _wtr / _trn, _sos,
-                                vjob["seeds"].ravel(),
-                                np.asarray(vjob["axes"]).ravel(),
-                                vs_sa, int(seed) + 1)
-                            vjob["sa_t0"] = time.time()
-                            st.rerun()
-                        _sst = webgpu_elastic.poll(vjob["sa_id"])
-                        vjob["k"] = _sst["prog"]
-                        if (_sst["prog"] == 0 and not _sst["done"]
-                                and time.time() - vjob["sa_t0"] > 60):
-                            vjob["wgpu_reason"] = "SA start timeout (60 s)"
-                            st.warning("Client GPU annealing did not start; "
-                                       "continuing on CPU.")
-                            vjob["wgpu_failed"] = True
-                            vjob["sa_id"] = None
-                            st.rerun()
-                        if _sst["error"]:
-                            vjob["wgpu_reason"] = f"SA error: {_sst['error']}"
-                            st.warning(f"Client GPU annealing failed "
-                                       f"({_sst['error']}); continuing on "
-                                       f"CPU.")
-                            vjob["wgpu_failed"] = True
-                            vjob["sa_id"] = None
-                            st.rerun()
-                        elif not _sst["done"]:
-                            st.rerun()
-                        else:
-                            _res = webgpu_elastic.sa_result(vjob["sa_id"])
-                            _bJ, _J0js = float(_res[0]), float(_res[1])
-                            _hn = int(_res[2])
-                            _G3 = 3 * vs_g
-                            _bs = _res[3:3 + _G3].reshape(-1, 3)
-                            _ba = _res[3 + _G3:3 + 2 * _G3].reshape(-1, 3)
-                            _rel = (abs(_J0js - vjob["J0"])
-                                    / max(vjob["J0"], 1e-30))
-                            if _rel > 5e-3:
-                                vjob["wgpu_reason"] = (
-                                    f"SA J0 parity rel {_rel:.1e}")
-                                st.warning(f"GPU annealing residual parity "
-                                           f"failed (rel {_rel:.1e}); "
-                                           f"continuing on CPU.")
+                            if _stat["error"]:
+                                vjob["wgpu_reason"] = f"eval error: {_stat['error']}"
+                                st.warning(f"Client GPU (elastic) failed "
+                                           f"({_stat['error']}); using CPU.")
                                 vjob["wgpu_failed"] = True
-                                vjob["sa_id"] = None
+                                vjob["pend"] = None
                                 st.rerun()
-                            st.caption(f"GPU annealing verified (J0 parity "
-                                       f"rel {_rel:.1e}); best J {_bJ:.4g}")
-                            vjob["seeds"] = np.asarray(_bs, float)
-                            vjob["axes"] = np.asarray(_ba, float)
-                            vjob["bJ"] = _bJ
-                            vjob["bseeds"] = vjob["seeds"].copy()
-                            vjob["baxes"] = vjob["axes"].copy()
-                            vjob["hist"].extend(
-                                float(v) for v in _res[3 + 2 * _G3:
-                                                       3 + 2 * _G3 + _hn][1:])
-                            vjob["k"] = vs_sa
-                            vjob["phase"] = "lm"
-                            vjob["lm"] = dict(
-                                it=0, sub="base", lam=1e-2,
-                                p=vi.params_pack(vjob["seeds"],
-                                                 vjob["axes"]),
-                                r=None, J=None, Jac=None, col=0, trial=0)
-                            if vs_lm == 0:
-                                vjob["lm"]["sub"] = "skip"
-                    elif vjob["phase"] == "anneal":
-                        rng = vjob["rng"]
-                        # several steps per rerun when evaluations are
-                        # synchronous (local): the rerun overhead is paid
-                        # once per chunk instead of per step
-                        _chunk = 1 if use_wgpu else 6
-                        for _c in range(_chunk):
-                            if vjob["k"] >= vs_sa:
-                                break
-                            if vjob.get("prop") is None:
-                                # cache the proposal: a pending GPU evaluation
-                                # must see the SAME move on every rerun
-                                vjob["prop"] = vi.sa_move(
-                                    vjob["seeds"], vjob["axes"],
-                                    vjob["_pts"], h, rng)[:2]
-                            s_t, a_t = vjob["prop"]
-                            Jt, _ = vJ(vi.params_pack(s_t, a_t))
-                            vjob["prop"] = None
-                            T = vi.sa_temperature(vjob["k"], vs_sa,
-                                                  vjob["J0"])
-                            if Jt < vjob["Jc"] or rng.random() < np.exp(
-                                    -(Jt - vjob["Jc"]) / max(T, 1e-30)):
-                                vjob["seeds"], vjob["axes"] = s_t, a_t
-                                vjob["Jc"] = Jt
-                            if Jt < vjob["bJ"]:
-                                vjob["bJ"] = Jt
-                                vjob["bseeds"] = s_t.copy()
-                                vjob["baxes"] = a_t.copy()
-                                vjob["hist"].append(Jt)
-                            vjob["k"] += 1
-                            vjob["evals"] += 1
-                        vjob["evals"] -= 1      # outer loop adds one more
-                        if vjob["k"] >= vs_sa:
-                            vjob["seeds"] = vjob["bseeds"].copy()
-                            vjob["axes"] = vjob["baxes"].copy()
-                            vjob["phase"] = "lm"
-                            vjob["lm"] = dict(
-                                it=0, sub="base", lam=1e-2,
-                                p=vi.params_pack(vjob["seeds"], vjob["axes"]),
-                                r=None, J=None, Jac=None, col=0, trial=0)
-                            if vs_lm == 0:
-                                vjob["lm"]["sub"] = "skip"
-                    else:                                   # lm or polish
-                        lm = vjob["lm"]
-                        if vjob["polish"]:
-                            fdv = np.radians(2.0)
-                        else:
-                            fdv = vi.fd_steps(vs_g, h)
-
-                        def _finish_lm():
-                            if vjob["polish"]:
-                                vjob["axes"] = cof.axes_from_params(
-                                    np.asarray(lm["p"]).reshape(-1, 2))
-                                return True                 # fully done
-                            vjob["seeds"], vjob["axes"] = vi.params_unpack(
-                                np.asarray(lm["p"]).ravel())
-                            vjob["bJ"] = lm["J"] if lm["J"] is not None \
-                                else vjob["bJ"]
-                            vjob["polish"] = True           # angle-only polish
-                            vjob["phase"] = "lm"
-                            vjob["lm"] = dict(
-                                it=0, sub="base", lam=1e-2,
-                                p=cof.params_from_axes(vjob["axes"]).ravel(),
-                                r=None, J=None, Jac=None, col=0, trial=0)
-                            return False
-
-                        if lm["sub"] == "skip":
-                            done = _finish_lm()
-                        elif lm["sub"] == "base":
-                            lm["J"], lm["r"] = vJ(lm["p"])
-                            vjob["hist"].append(lm["J"])
-                            lm["Jac"] = np.empty((lm["r"].size, lm["p"].size))
-                            lm["sub"] = "col"; lm["col"] = 0
-                        elif lm["sub"] == "col":
-                            k = lm["col"]
-                            pk = np.asarray(lm["p"], float).copy()
-                            fk = fdv if np.ndim(fdv) == 0 else fdv[k]
-                            pk[k] += fk
-                            _, rk = vJ(pk)
-                            lm["Jac"][:, k] = (rk - lm["r"]) / fk
-                            lm["col"] += 1
-                            if lm["col"] >= np.asarray(lm["p"]).size:
-                                lm["sub"] = "trial"; lm["trial"] = 0
-                        else:                               # trial
-                            Jc = lm["Jac"]
-                            gv = Jc.T @ lm["r"]
-                            Hm = Jc.T @ Jc
-                            step = np.linalg.solve(
-                                Hm + lm["lam"] * np.diag(np.diag(Hm) + 1e-30),
-                                -gv)
-                            p_try = np.asarray(lm["p"]) + step
-                            J_try, _ = vJ(p_try)
-                            n_lm = 2 if vjob["polish"] else vs_lm
-                            if J_try < lm["J"]:
-                                lm["p"] = p_try
-                                lm["lam"] = max(lm["lam"] / 3.0, 1e-8)
-                                lm["it"] += 1
-                                lm["sub"] = "base"
-                                if lm["it"] >= n_lm:
-                                    done = _finish_lm()
+                            elif not _stat["done"]:
+                                js_progress(min(vjob["evals"] / max(vjob["est"], 1),
+                                                1.0),
+                                            f"Voronoi evaluation "
+                                            f"{vjob['evals'] + 1}/~{vjob['est']} on "
+                                            f"YOUR GPU (WebGPU): step "
+                                            f"{_stat['prog']}/{_stat['total']}")
+                                st.rerun()
                             else:
-                                lm["lam"] *= 5.0
-                                lm["trial"] += 1
-                                if lm["trial"] >= 5:
-                                    done = _finish_lm()
-                    vjob["evals"] += 1
-                    if not done:
-                        st.rerun()
-                except _PendingEval:
-                    st.rerun()
-                js_progress(done=True)
-                lab_f = vi.hard_labels(vjob["seeds"], vs_mask, h)
-                par_f = cof.params_from_axes(vjob["axes"])
-                colat_f = np.zeros(vs_mask.shape)
-                azim_f = np.zeros(vs_mask.shape)
-                for _k in range(vs_g):
-                    _m = lab_f == _k
-                    colat_f[_m] = par_f[_k, 0]
-                    azim_f[_m] = par_f[_k, 1]
-                true_ax_map = np.zeros(vs_mask.shape + (3,))
-                for _k in range(len(axes3)):
-                    true_ax_map[labels == _k] = axes3[_k]
-                errm = axisfield.axis_error_map(colat_f, azim_f,
-                                                true_ax_map, vs_mask)
-                st.session_state.vs_result = dict(
-                    labels=lab_f, axes=np.asarray(vjob["axes"]),
-                    colat_deg=np.degrees(par_f[:, 0]),
-                    err=np.where(vs_mask, errm, np.nan),
-                    mean_err=float(errm[vs_mask].mean()),
-                    max_err=float(errm[vs_mask].max()),
-                    hist=list(vjob["hist"]), evals=vjob["evals"],
-                    secs=time.time() - vjob["t0"])
-                del st.session_state.vs_job
+                                _d = webgpu_elastic.result(_pend["id"], len(src_sub),
+                                                           nt, len(ring.idx))
+                                _rg = _v_res_from_traces(_d)
+                                if not vjob.get("wgpu_checked"):
+                                    js_progress(0.05, "First GPU evaluation done; "
+                                                      "verifying one transmit on the "
+                                                      "CPU (one-off parity check) ...")
+                                    _pp = np.frombuffer(_pend["key"], dtype=float)
+                                    _Cm0, _rho0 = _v_maps(_pp)
+                                    _ref0, _ = elastic3d.forward(
+                                        _Cm0, _rho0, h, dt, nt,
+                                        ring.element_index(src_sub[0]), wavelet,
+                                        ring.idx, source="explosive",
+                                        record="pressure", device="cpu")
+                                    _rel = (np.max(np.abs(_d[0] - _ref0))
+                                            / (np.max(np.abs(_ref0)) + 1e-30))
+                                    if _rel < 5e-3:
+                                        vjob["wgpu_checked"] = True
+                                        st.caption(f"Client-GPU elastic evaluation "
+                                                   f"verified: rel {_rel:.1e}")
+                                    else:
+                                        vjob["wgpu_reason"] = (
+                                            f"eval parity rel {_rel:.1e}")
+                                        st.warning(f"Client-GPU elastic parity failed "
+                                                   f"(rel {_rel:.1e}); using CPU.")
+                                        vjob["wgpu_failed"] = True
+                                        vjob["pend"] = None
+                                        st.rerun()
+                                _pend["r"] = _rg
 
-            vres = st.session_state.get("vs_result")
-            if vres is not None:
-                import plotly.graph_objects as go
-                st.success(f"Voronoi grains recovered (geometry + axes, no "
-                           f"prior) in {vres['evals']} evaluations "
-                           f"({hms(vres['secs'])}): mean axis error "
-                           f"{vres['mean_err']:.1f} deg, max "
-                           f"{vres['max_err']:.1f} deg")
-                colat_t3 = np.degrees(np.arccos(np.clip(
-                    np.abs(axes3[:, 2]), 0, 1)))
-                vca, vcb = st.columns(2)
-                with vca:
-                    st.plotly_chart(render3d.polycrystal_figure(
-                        labels, colat_t3, h, "True grains (colatitude)",
-                        vmin=0, vmax=90), width="stretch")
-                with vcb:
-                    st.plotly_chart(render3d.polycrystal_figure(
-                        vres["labels"], vres["colat_deg"], h,
-                        "Recovered grains (geometry + colatitude)",
-                        vmin=0, vmax=90), width="stretch")
-                mmv = np.arange(n) * h * 1e3
-                verr = np.nan_to_num(vres["err"], nan=-1e3)
-                zc, yc, xc = np.meshgrid(mmv, mmv, mmv, indexing="ij")
-                fe = go.Figure(go.Volume(
-                    x=xc.ravel(), y=yc.ravel(), z=zc.ravel(),
-                    value=verr.ravel(), isomin=5.0, isomax=45.0,
-                    opacity=0.15, surface_count=17, colorscale="Inferno",
-                    colorbar=dict(title="deg"),
-                    caps=dict(x_show=False, y_show=False, z_show=False)))
-                fe.add_trace(go.Scatter3d(
-                    x=elem_abs[:, 0] * 1e3, y=elem_abs[:, 1] * 1e3,
-                    z=elem_abs[:, 2] * 1e3, mode="markers",
-                    marker=dict(size=3, color="#00e5ff"),
-                    showlegend=False, hoverinfo="skip"))
-                fe.update_layout(title="Axis error (only regions above 5 deg "
-                                       "shown; empty box = perfect)",
-                                 height=430, margin=dict(l=0, r=0, t=40, b=0),
-                                 scene=dict(xaxis_title="x (mm)",
-                                            yaxis_title="y (mm)",
-                                            zaxis_title="z (mm)"))
-                st.plotly_chart(fe, width="stretch")
-                fv = go.Figure(go.Scatter(y=vres["hist"],
-                                          mode="lines+markers"))
-                fv.update_yaxes(type="log", title="misfit")
-                fv.update_layout(title="Voronoi-seed convergence (accepted "
-                                       "improvements)",
-                                 xaxis_title="accepted update", height=260,
-                                 margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fv, width="stretch")
+                        def vJ(params_flat):
+                            p_ = np.asarray(params_flat, float).ravel()
+                            if use_wgpu:
+                                key = p_.tobytes()
+                                pend = vjob.get("pend")
+                                if (pend is not None and pend["key"] == key
+                                        and pend.get("r") is not None):
+                                    r_ = pend["r"]
+                                    vjob["pend"] = None
+                                    return 0.5 * float(r_ @ r_), r_
+                                if pend is None or pend["key"] != key:
+                                    Cm_, rho_ = _v_maps(p_)
+                                    vjob["pend"] = dict(
+                                        key=key, r=None, t0=time.time(),
+                                        id=webgpu_elastic.start(
+                                            Cm_, rho_, h, dt, nt, wavelet, _spa,
+                                            ring.idx))
+                                raise _PendingEval()
+                            r_ = res_fn(p_)
+                            return 0.5 * float(r_ @ r_), r_
+
+                        if vjob.get("wgpu_reason"):
+                            st.info(f"Running on CPU (GPU fallback: "
+                                    f"{vjob['wgpu_reason']})")
+                        frac = vjob["evals"] / max(vjob["est"], 1)
+                        el = time.time() - vjob["t0"]
+                        eta = el / max(vjob["evals"], 1) * max(vjob["est"] - vjob["evals"], 0)
+                        _T = (vi.sa_temperature(vjob["k"], max(vs_sa, 1), vjob["J0"])
+                              if vjob["phase"] == "anneal" and vjob["J0"] else None)
+                        msg = (f"Voronoi seeds [{vjob['phase']}"
+                               + (f" T={_T:.3g}" if _T is not None else "")
+                               + f"]: evaluation "
+                               f"{vjob['evals'] + 1}/~{vjob['est']}"
+                               + (f" ({hms(el)} elapsed, ~{hms(eta)} remaining)"
+                                  if vjob["evals"] else " ..."))
+                        js_progress(min(frac, 1.0), msg)
+                        if not IN_BROWSER:
+                            st.progress(min(frac, 1.0), text=msg)
+
+                        try:
+                            done = False
+                            if vjob["phase"] == "init":
+                                J0, _ = vJ(vi.params_pack(vjob["seeds"], vjob["axes"]))
+                                vjob["J0"] = J0; vjob["Jc"] = J0; vjob["bJ"] = J0
+                                vjob["bseeds"] = vjob["seeds"].copy()
+                                vjob["baxes"] = vjob["axes"].copy()
+                                vjob["hist"].append(J0)
+                                vjob["_pts"] = vi.mask_points(vs_mask, h)
+                                if vs_sa > 0:
+                                    vjob["phase"] = "anneal"
+                                else:
+                                    vjob["phase"] = "lm"
+                                    vjob["lm"]["p"] = vi.params_pack(vjob["seeds"],
+                                                                     vjob["axes"])
+                                    if vs_lm == 0:
+                                        vjob["lm"]["sub"] = "skip"
+                            elif vjob["phase"] == "anneal" and use_wgpu:
+                                # whole annealing loop as ONE main-thread GPU job --
+                                # no per-step rerun tax (the browser speed fix)
+                                if vjob.get("sa_id") is None:
+                                    _msk = vs_mask
+                                    _K = 1000.0 * 1480.0 ** 2
+                                    _mb = np.zeros((22, n * n * n), np.float32)
+                                    for _k2, _key in enumerate(vi._KEYS21):
+                                        _i2 = int(_key[1]) - 1
+                                        _j2 = int(_key[2]) - 1
+                                        if _i2 < 3 and _j2 < 3:
+                                            _mb[_k2] = _K
+                                    _rhof = np.full((n, n, n), 1000.0, np.float32)
+                                    _rhof[_msk] = material["rho"]
+                                    _mb[21] = _rhof.ravel()
+                                    _x, _y, _z = vi.grid_coords(_msk.shape, h)
+                                    _cells = np.flatnonzero(_msk.ravel())
+                                    _sos = np.zeros((0, 6))
+                                    if rx_filt_on:
+                                        from scipy.signal import butter as _butter
+                                        _sos = _butter(2, [rx_lo_x * f0, rx_hi_x * f0],
+                                                       btype="bandpass", fs=fs,
+                                                       output="sos")
+
+                                    def _lin3(t):
+                                        return (t[0] * n + t[1]) * n + t[2]
+
+                                    vjob["sa_id"] = webgpu_elastic.sa_start(
+                                        (n, n, n), _mb, _cells,
+                                        _x[_msk], _y[_msk], _z[_msk],
+                                        anisotropy.ti_stiffness_6(**material),
+                                        h, dt, nt, 1.5, wavelet,
+                                        [_lin3(ring.element_index(s_))
+                                         for s_ in src_sub],
+                                        [_lin3(t_) for t_ in ring.idx],
+                                        dobs_sub, _wtr / _trn, _sos,
+                                        vjob["seeds"].ravel(),
+                                        np.asarray(vjob["axes"]).ravel(),
+                                        vs_sa, int(seed) + 1)
+                                    vjob["sa_t0"] = time.time()
+                                    st.rerun()
+                                _sst = webgpu_elastic.poll(vjob["sa_id"])
+                                vjob["k"] = _sst["prog"]
+                                if (_sst["prog"] == 0 and not _sst["done"]
+                                        and time.time() - vjob["sa_t0"] > 60):
+                                    vjob["wgpu_reason"] = "SA start timeout (60 s)"
+                                    st.warning("Client GPU annealing did not start; "
+                                               "continuing on CPU.")
+                                    vjob["wgpu_failed"] = True
+                                    vjob["sa_id"] = None
+                                    st.rerun()
+                                if _sst["error"]:
+                                    vjob["wgpu_reason"] = f"SA error: {_sst['error']}"
+                                    st.warning(f"Client GPU annealing failed "
+                                               f"({_sst['error']}); continuing on "
+                                               f"CPU.")
+                                    vjob["wgpu_failed"] = True
+                                    vjob["sa_id"] = None
+                                    st.rerun()
+                                elif not _sst["done"]:
+                                    st.rerun()
+                                else:
+                                    _res = webgpu_elastic.sa_result(vjob["sa_id"])
+                                    _bJ, _J0js = float(_res[0]), float(_res[1])
+                                    _hn = int(_res[2])
+                                    _G3 = 3 * vs_g
+                                    _bs = _res[3:3 + _G3].reshape(-1, 3)
+                                    _ba = _res[3 + _G3:3 + 2 * _G3].reshape(-1, 3)
+                                    _rel = (abs(_J0js - vjob["J0"])
+                                            / max(vjob["J0"], 1e-30))
+                                    if _rel > 5e-3:
+                                        vjob["wgpu_reason"] = (
+                                            f"SA J0 parity rel {_rel:.1e}")
+                                        st.warning(f"GPU annealing residual parity "
+                                                   f"failed (rel {_rel:.1e}); "
+                                                   f"continuing on CPU.")
+                                        vjob["wgpu_failed"] = True
+                                        vjob["sa_id"] = None
+                                        st.rerun()
+                                    st.caption(f"GPU annealing verified (J0 parity "
+                                               f"rel {_rel:.1e}); best J {_bJ:.4g}")
+                                    vjob["seeds"] = np.asarray(_bs, float)
+                                    vjob["axes"] = np.asarray(_ba, float)
+                                    vjob["bJ"] = _bJ
+                                    vjob["bseeds"] = vjob["seeds"].copy()
+                                    vjob["baxes"] = vjob["axes"].copy()
+                                    vjob["hist"].extend(
+                                        float(v) for v in _res[3 + 2 * _G3:
+                                                               3 + 2 * _G3 + _hn][1:])
+                                    vjob["k"] = vs_sa
+                                    vjob["phase"] = "lm"
+                                    vjob["lm"] = dict(
+                                        it=0, sub="base", lam=1e-2,
+                                        p=vi.params_pack(vjob["seeds"],
+                                                         vjob["axes"]),
+                                        r=None, J=None, Jac=None, col=0, trial=0)
+                                    if vs_lm == 0:
+                                        vjob["lm"]["sub"] = "skip"
+                            elif vjob["phase"] == "anneal":
+                                rng = vjob["rng"]
+                                # several steps per rerun when evaluations are
+                                # synchronous (local): the rerun overhead is paid
+                                # once per chunk instead of per step
+                                _chunk = 1 if use_wgpu else 6
+                                for _c in range(_chunk):
+                                    if vjob["k"] >= vs_sa:
+                                        break
+                                    if vjob.get("prop") is None:
+                                        # cache the proposal: a pending GPU evaluation
+                                        # must see the SAME move on every rerun
+                                        vjob["prop"] = vi.sa_move(
+                                            vjob["seeds"], vjob["axes"],
+                                            vjob["_pts"], h, rng)[:2]
+                                    s_t, a_t = vjob["prop"]
+                                    Jt, _ = vJ(vi.params_pack(s_t, a_t))
+                                    vjob["prop"] = None
+                                    T = vi.sa_temperature(vjob["k"], vs_sa,
+                                                          vjob["J0"])
+                                    if Jt < vjob["Jc"] or rng.random() < np.exp(
+                                            -(Jt - vjob["Jc"]) / max(T, 1e-30)):
+                                        vjob["seeds"], vjob["axes"] = s_t, a_t
+                                        vjob["Jc"] = Jt
+                                    if Jt < vjob["bJ"]:
+                                        vjob["bJ"] = Jt
+                                        vjob["bseeds"] = s_t.copy()
+                                        vjob["baxes"] = a_t.copy()
+                                        vjob["hist"].append(Jt)
+                                    vjob["k"] += 1
+                                    vjob["evals"] += 1
+                                vjob["evals"] -= 1      # outer loop adds one more
+                                if vjob["k"] >= vs_sa:
+                                    vjob["seeds"] = vjob["bseeds"].copy()
+                                    vjob["axes"] = vjob["baxes"].copy()
+                                    vjob["phase"] = "lm"
+                                    vjob["lm"] = dict(
+                                        it=0, sub="base", lam=1e-2,
+                                        p=vi.params_pack(vjob["seeds"], vjob["axes"]),
+                                        r=None, J=None, Jac=None, col=0, trial=0)
+                                    if vs_lm == 0:
+                                        vjob["lm"]["sub"] = "skip"
+                            else:                                   # lm or polish
+                                lm = vjob["lm"]
+                                if vjob["polish"]:
+                                    fdv = np.radians(2.0)
+                                else:
+                                    fdv = vi.fd_steps(vs_g, h)
+
+                                def _finish_lm():
+                                    if vjob["polish"]:
+                                        vjob["axes"] = cof.axes_from_params(
+                                            np.asarray(lm["p"]).reshape(-1, 2))
+                                        return True                 # fully done
+                                    vjob["seeds"], vjob["axes"] = vi.params_unpack(
+                                        np.asarray(lm["p"]).ravel())
+                                    vjob["bJ"] = lm["J"] if lm["J"] is not None \
+                                        else vjob["bJ"]
+                                    vjob["polish"] = True           # angle-only polish
+                                    vjob["phase"] = "lm"
+                                    vjob["lm"] = dict(
+                                        it=0, sub="base", lam=1e-2,
+                                        p=cof.params_from_axes(vjob["axes"]).ravel(),
+                                        r=None, J=None, Jac=None, col=0, trial=0)
+                                    return False
+
+                                if lm["sub"] == "skip":
+                                    done = _finish_lm()
+                                elif lm["sub"] == "base":
+                                    lm["J"], lm["r"] = vJ(lm["p"])
+                                    vjob["hist"].append(lm["J"])
+                                    lm["Jac"] = np.empty((lm["r"].size, lm["p"].size))
+                                    lm["sub"] = "col"; lm["col"] = 0
+                                elif lm["sub"] == "col":
+                                    k = lm["col"]
+                                    pk = np.asarray(lm["p"], float).copy()
+                                    fk = fdv if np.ndim(fdv) == 0 else fdv[k]
+                                    pk[k] += fk
+                                    _, rk = vJ(pk)
+                                    lm["Jac"][:, k] = (rk - lm["r"]) / fk
+                                    lm["col"] += 1
+                                    if lm["col"] >= np.asarray(lm["p"]).size:
+                                        lm["sub"] = "trial"; lm["trial"] = 0
+                                else:                               # trial
+                                    Jc = lm["Jac"]
+                                    gv = Jc.T @ lm["r"]
+                                    Hm = Jc.T @ Jc
+                                    step = np.linalg.solve(
+                                        Hm + lm["lam"] * np.diag(np.diag(Hm) + 1e-30),
+                                        -gv)
+                                    p_try = np.asarray(lm["p"]) + step
+                                    J_try, _ = vJ(p_try)
+                                    n_lm = 2 if vjob["polish"] else vs_lm
+                                    if J_try < lm["J"]:
+                                        lm["p"] = p_try
+                                        lm["lam"] = max(lm["lam"] / 3.0, 1e-8)
+                                        lm["it"] += 1
+                                        lm["sub"] = "base"
+                                        if lm["it"] >= n_lm:
+                                            done = _finish_lm()
+                                    else:
+                                        lm["lam"] *= 5.0
+                                        lm["trial"] += 1
+                                        if lm["trial"] >= 5:
+                                            done = _finish_lm()
+                            vjob["evals"] += 1
+                            if not done:
+                                st.rerun()
+                        except _PendingEval:
+                            st.rerun()
+                        js_progress(done=True)
+                        lab_f = vi.hard_labels(vjob["seeds"], vs_mask, h)
+                        par_f = cof.params_from_axes(vjob["axes"])
+                        colat_f = np.zeros(vs_mask.shape)
+                        azim_f = np.zeros(vs_mask.shape)
+                        for _k in range(vs_g):
+                            _m = lab_f == _k
+                            colat_f[_m] = par_f[_k, 0]
+                            azim_f[_m] = par_f[_k, 1]
+                        true_ax_map = np.zeros(vs_mask.shape + (3,))
+                        for _k in range(len(axes3)):
+                            true_ax_map[labels == _k] = axes3[_k]
+                        errm = axisfield.axis_error_map(colat_f, azim_f,
+                                                        true_ax_map, vs_mask)
+                        st.session_state.vs_result = dict(
+                            labels=lab_f, axes=np.asarray(vjob["axes"]),
+                            colat_deg=np.degrees(par_f[:, 0]),
+                            err=np.where(vs_mask, errm, np.nan),
+                            mean_err=float(errm[vs_mask].mean()),
+                            max_err=float(errm[vs_mask].max()),
+                            hist=list(vjob["hist"]), evals=vjob["evals"],
+                            secs=time.time() - vjob["t0"])
+                        del st.session_state.vs_job
+
+                    vres = st.session_state.get("vs_result")
+                    if vres is not None:
+                        import plotly.graph_objects as go
+                        st.success(f"Voronoi grains recovered (geometry + axes, no "
+                                   f"prior) in {vres['evals']} evaluations "
+                                   f"({hms(vres['secs'])}): mean axis error "
+                                   f"{vres['mean_err']:.1f} deg, max "
+                                   f"{vres['max_err']:.1f} deg")
+                        colat_t3 = np.degrees(np.arccos(np.clip(
+                            np.abs(axes3[:, 2]), 0, 1)))
+                        vca, vcb = st.columns(2)
+                        with vca:
+                            st.plotly_chart(render3d.polycrystal_figure(
+                                labels, colat_t3, h, "True grains (colatitude)",
+                                vmin=0, vmax=90), width="stretch")
+                        with vcb:
+                            st.plotly_chart(render3d.polycrystal_figure(
+                                vres["labels"], vres["colat_deg"], h,
+                                "Recovered grains (geometry + colatitude)",
+                                vmin=0, vmax=90), width="stretch")
+                        mmv = np.arange(n) * h * 1e3
+                        verr = np.nan_to_num(vres["err"], nan=-1e3)
+                        zc, yc, xc = np.meshgrid(mmv, mmv, mmv, indexing="ij")
+                        fe = go.Figure(go.Volume(
+                            x=xc.ravel(), y=yc.ravel(), z=zc.ravel(),
+                            value=verr.ravel(), isomin=5.0, isomax=45.0,
+                            opacity=0.15, surface_count=17, colorscale="Inferno",
+                            colorbar=dict(title="deg"),
+                            caps=dict(x_show=False, y_show=False, z_show=False)))
+                        fe.add_trace(go.Scatter3d(
+                            x=elem_abs[:, 0] * 1e3, y=elem_abs[:, 1] * 1e3,
+                            z=elem_abs[:, 2] * 1e3, mode="markers",
+                            marker=dict(size=3, color="#00e5ff"),
+                            showlegend=False, hoverinfo="skip"))
+                        fe.update_layout(title="Axis error (only regions above 5 deg "
+                                               "shown; empty box = perfect)",
+                                         height=430, margin=dict(l=0, r=0, t=40, b=0),
+                                         scene=dict(xaxis_title="x (mm)",
+                                                    yaxis_title="y (mm)",
+                                                    zaxis_title="z (mm)"))
+                        st.plotly_chart(fe, width="stretch")
+                        fv = go.Figure(go.Scatter(y=vres["hist"],
+                                                  mode="lines+markers"))
+                        fv.update_yaxes(type="log", title="misfit")
+                        fv.update_layout(title="Voronoi-seed convergence (accepted "
+                                               "improvements)",
+                                         xaxis_title="accepted update", height=260,
+                                         margin=dict(l=10, r=10, t=40, b=10))
+                        st.plotly_chart(fv, width="stretch")
