@@ -365,7 +365,9 @@ globalThis.__oueSA = function (id, cfg) {
       const W = F32(cfg.W);
       const sos = F32(cfg.sos);
       const P = cells.length;
-      const s2 = 2.0 * (cfg.tau * cfg.h) * (cfg.tau * cfg.h);
+      const tau0 = cfg.tau || 1.5;
+      const tauEnd = cfg.tauEnd || tau0;
+      const restarts = Math.max(1, cfg.restarts || 1);
 
       const pipe = __oueEnsurePipes(dev, nt);
       const mk = (sz, usage) => dev.createBuffer({ size: sz, usage: usage });
@@ -409,7 +411,8 @@ globalThis.__oueSA = function (id, cfg) {
       const Cg = [];
       const w = new Float64Array(G);
 
-      function buildMat(seeds, axes) {
+      function buildMat(seeds, axes, tau) {
+        const s2 = 2.0 * (tau * cfg.h) * (tau * cfg.h);
         for (let g = 0; g < G; g++) Cg[g] = __oueRot6(base6, axes[g]);
         for (let q = 0; q < P; q++) {
           const cx = px[q], cy = py[q], cz = pz[q];
@@ -514,13 +517,26 @@ globalThis.__oueSA = function (id, cfg) {
         return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v2);
       };
 
-      buildMat(seeds, axes);
+      buildMat(seeds, axes, tau0);
       const J0 = J_of(await forward());
       let Jc = J0, bJ = J0;
       let bSeeds = clone(seeds), bAxes = clone(axes);
       const hist = [J0];
 
+      const segLen = Math.ceil(cfg.steps / restarts);
       for (let k = 0; k < cfg.steps; k++) {
+        const tauK = tau0 * Math.pow(tauEnd / tau0,
+                                     k / Math.max(cfg.steps - 1, 1));
+        if (k > 0 && k % segLen === 0) {
+          // restart: fresh random chain, global best kept
+          for (let g2 = 0; g2 < G; g2++) {
+            const q = Math.floor(rng() * P);
+            seeds[g2] = [px[q], py[q], pz[q]];
+            axes[g2] = norm3([gauss(), gauss(), Math.abs(gauss())]);
+          }
+          buildMat(seeds, axes, tauK);
+          Jc = J_of(await forward());
+        }
         const sT = clone(seeds), aT = clone(axes);
         const g = Math.floor(rng() * G);
         const u = rng();
@@ -542,7 +558,7 @@ globalThis.__oueSA = function (id, cfg) {
           const g2 = Math.floor(rng() * G);
           const tmp = aT[g]; aT[g] = aT[g2]; aT[g2] = tmp;
         }
-        buildMat(sT, aT);
+        buildMat(sT, aT, tauK);
         const Jt = J_of(await forward());
         const T = J0 * 0.3 * Math.pow(1e-3 / 0.3,
                                       k / Math.max(cfg.steps - 1, 1));
@@ -818,7 +834,7 @@ def result(job_id, B, nt, n_rx):
 
 def sa_start(shape, mat_base, cells, px, py, pz, base6, h, dt, nt, tau,
              wavelet, src_cells, rec_lin, dobs, W, sos, seeds0, axes0,
-             steps, rng_seed):
+             steps, rng_seed, tau_end=0.5, restarts=3):
     """Launch the ENTIRE annealing loop as one main-thread job.
 
     The main thread does proposals, soft-Voronoi model building, batched GPU
@@ -840,6 +856,7 @@ def sa_start(shape, mat_base, cells, px, py, pz, base6, h, dt, nt, tau,
         type="sa_start", id=job_id, nz=nz, ny=ny, nx=nx,
         B=int(len(src_cells)), nt=int(nt), nrx=int(len(rec_lin)), G=G,
         invh=float(1.0 / h), dt=float(dt), h=float(h), tau=float(tau),
+        tauEnd=float(tau_end), restarts=int(restarts),
         steps=int(steps), rngSeed=int(rng_seed) & 0x7FFFFFFF,
         matBase=np.asarray(mat_base, np.float32).ravel().tobytes(),
         cells=np.asarray(cells, np.uint32).tobytes(),

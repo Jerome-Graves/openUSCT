@@ -1894,14 +1894,14 @@ if tab_fwi is not None:
                     vs1, vs2, vs3, vs4 = st.columns(4)
                     with vs1:
                         vs_tx = st.slider("Transmits ", 2, len(src_list),
-                                          min(4, len(src_list)), key="vs_tx")
+                                          min(12, len(src_list)), key="vs_tx")
                     with vs2:
                         vs_g = st.slider("Grains (seeds)", 2, 10, 6, key="vs_g",
                                          help="Number of Voronoi cells to invert. "
                                               "Need not match the truth exactly; "
                                               "extra cells can share an axis.")
                     with vs3:
-                        vs_sa = st.slider("Annealing steps", 0, 4000, 600, 100,
+                        vs_sa = st.slider("Annealing steps", 0, 4000, 900, 100,
                                           key="vs_sa",
                                           help="Metropolis moves over seeds and axes "
                                                "with geometric cooling; the stage "
@@ -1970,9 +1970,11 @@ if tab_fwi is not None:
                                 filter_fn=lambda d: apply_rx_filter(d, axis=1))
                         else:
                             lab_now = None
+                            _tau_now = (vi.sa_tau(vjob["k"], max(vs_sa, 1))
+                                        if vjob["phase"] in ("init", "anneal") else 0.5)
                             res_fn = vi.make_residual_seeds(
                                 vs_mask, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
-                                material=material,
+                                material=material, tau_voxels=_tau_now,
                                 filter_fn=lambda d: apply_rx_filter(d, axis=1))
 
                         # --- evaluation backend: CPU (sync) or client GPU (async) ---
@@ -1999,7 +2001,7 @@ if tab_fwi is not None:
                             seeds_p, axes_p = vi.params_unpack(np.asarray(p_).ravel())
                             return vi.blended_maps(seeds_p, axes_p, vs_mask, h,
                                                    _vs_base6, _vs_Cbg, 1000.0,
-                                                   material["rho"])
+                                                   material["rho"], tau_voxels=_tau_now)
 
                         def _v_res_from_traces(d):
                             d = apply_rx_filter(d, axis=1)
@@ -2161,7 +2163,7 @@ if tab_fwi is not None:
                                         dobs_sub, _wtr / _trn, _sos,
                                         vjob["seeds"].ravel(),
                                         np.asarray(vjob["axes"]).ravel(),
-                                        vs_sa, int(seed) + 1)
+                                        vs_sa, int(seed) + 1, tau_end=0.5, restarts=3)
                                     vjob["sa_t0"] = time.time()
                                     st.rerun()
                                 _sst = webgpu_elastic.poll(vjob["sa_id"])
@@ -2227,9 +2229,19 @@ if tab_fwi is not None:
                                 # synchronous (local): the rerun overhead is paid
                                 # once per chunk instead of per step
                                 _chunk = 1 if use_wgpu else 6
+                                _seg = max(1, vs_sa // 3)
                                 for _c in range(_chunk):
                                     if vjob["k"] >= vs_sa:
                                         break
+                                    if (vjob["k"] > 0 and vjob["k"] % _seg == 0
+                                            and vjob.get("rs_done", -1) < vjob["k"]):
+                                        # restart: fresh random chain, global best kept
+                                        vjob["rs_done"] = vjob["k"]
+                                        for _g in range(vs_g):
+                                            _q = int(rng.integers(len(vjob["_pts"])))
+                                            vjob["seeds"][_g] = vjob["_pts"][_q]
+                                            vjob["axes"][_g] = vi.random_axis(rng)
+                                        vjob["Jc"] = float("inf")
                                     if vjob.get("prop") is None:
                                         # cache the proposal: a pending GPU evaluation
                                         # must see the SAME move on every rerun

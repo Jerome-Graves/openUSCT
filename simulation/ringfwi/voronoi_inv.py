@@ -215,3 +215,11 @@ def sa_temperature(k, n_steps, J0, frac0=0.3, frac_end=1e-3):
     """Geometric cooling from frac0*J0 to frac_end*J0 over n_steps."""
     r = frac_end / frac0
     return J0 * frac0 * (r ** (k / max(n_steps - 1, 1)))
+
+
+def sa_tau(k, n_steps, tau0=1.5, tau_end=0.5):
+    """Boundary-sharpness schedule for the annealing: soft Voronoi blending
+    (differentiable, forgiving) early, near-hard boundaries late, so the
+    final search no longer pays the soft-model misfit floor."""
+    r = tau_end / tau0
+    return tau0 * (r ** (k / max(n_steps - 1, 1)))
