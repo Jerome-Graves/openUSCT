@@ -163,7 +163,7 @@ def grain_colors(grain_values, vmin=0.0, vmax=90.0, cmap_name="twilight"):
 
 
 def polycrystal_figure(labels, grain_values, h, title="", vmin=0.0, vmax=90.0,
-                       cmap_name="twilight", melt_mask=None):
+                       cmap_name="twilight", melt_mask=None, opacity=0.55):
     """Interactive 3D render of a Voronoi polycrystal (Plotly).
 
     Each grain is extracted with marching cubes and coloured by its scalar
@@ -188,7 +188,7 @@ def polycrystal_figure(labels, grain_values, h, title="", vmin=0.0, vmax=90.0,
             x=verts[:, 2] * 1e3, y=verts[:, 1] * 1e3, z=verts[:, 0] * 1e3,
             i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
             color=colors[int(k)],
-            opacity=1.0, flatshading=True, name=f"grain {k}",
+            opacity=opacity, flatshading=True, name=f"grain {k}",
             hovertext=f"grain {k}: {float(grain_values[k]):.0f}", showlegend=False))
     if melt_mask is not None and melt_mask.any():
         mask = np.pad(melt_mask.astype(float), 1)
