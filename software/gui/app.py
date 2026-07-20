@@ -451,9 +451,10 @@ def _vol3d(vol, title, cmin, cmax, scale, zlab="deg"):
     return fig
 
 
-def live_pair(true_key, make_true, make_cur):
+def live_pair(true_key, make_true, make_cur, hist=None, best=None):
     """Live 3D view: LEFT the original (cached once), RIGHT the evolving
-    current estimate, re-rendered on every rerun of a running solver."""
+    current estimate, re-rendered on every rerun of a running solver; the
+    residual history animates in a slim chart underneath."""
     c1, c2 = st.columns(2)
     if true_key not in st.session_state:
         st.session_state[true_key] = make_true()
@@ -463,6 +464,18 @@ def live_pair(true_key, make_true, make_cur):
     with c2:
         st.plotly_chart(make_cur(), width="stretch",
                         key=f"lpc_{true_key}_{np.random.randint(10 ** 9)}")
+    if hist is not None and len(hist) > 1:
+        import plotly.graph_objects as go
+        figJ = go.Figure(go.Scatter(y=np.asarray(hist, float), mode="lines",
+                                    line=dict(color="#54a8d6", width=2)))
+        figJ.update_yaxes(type="log", title="misfit")
+        figJ.update_layout(
+            title=(f"Residual (best J {best:.3g})" if best is not None
+                   else "Residual"),
+            height=190, margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title="accepted update")
+        st.plotly_chart(figJ, width="stretch",
+                        key=f"lph_{true_key}_{np.random.randint(10 ** 9)}")
 
 
 def _true_grain_fig():
@@ -1184,7 +1197,8 @@ if tab_fwi is not None:
                               lambda: _vol3d(phantom.m_to_velocity(fjob["m"]),
                                              f"Current estimate (iteration {fjob.get('it', 0)})",
                                              float(vlo), float(vhi), "Viridis",
-                                             "m/s"))
+                                             "m/s"),
+                                             hist=fjob.get("hist"))
                 except Exception:
                     pass
             if fjob is not None:
@@ -1364,7 +1378,8 @@ if tab_fwi is not None:
                                       lambda: render3d.polycrystal_figure(
                                           labels, np.degrees(_pc[:, 0]), h,
                                           f"Current axes ({cjob['phase']})",
-                                          vmin=0, vmax=90))
+                                          vmin=0, vmax=90),
+                                          hist=cjob.get("hist"), best=cjob.get("j_cur"))
                         except Exception:
                             pass
                     if cjob is not None:
@@ -1601,7 +1616,8 @@ if tab_fwi is not None:
                                           np.where(labels >= 0,
                                                    np.degrees(ojob["colat"]), np.nan),
                                           f"Current field ({ojob['phase']})",
-                                          0.0, 90.0, "Twilight"))
+                                          0.0, 90.0, "Twilight"),
+                                          hist=ojob.get("hist"), best=ojob.get("bJ"))
                         except Exception:
                             pass
                     if ojob is not None:
@@ -1959,7 +1975,8 @@ if tab_fwi is not None:
                                           lambda: render3d.polycrystal_figure(
                                               _labN, np.degrees(_paN[:, 0]), h,
                                               f"Current grains ({vjob['phase']})",
-                                              vmin=0, vmax=90))
+                                              vmin=0, vmax=90),
+                                              hist=vjob.get("hist"), best=vjob.get("bJ"))
                             except Exception:
                                 pass
                         if vjob["polish"]:
