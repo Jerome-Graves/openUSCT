@@ -101,6 +101,14 @@ st.markdown(
     '<span style="font-size:2.4rem;font-weight:700;">OpenUSCT Studio</span>'
     "</div>", unsafe_allow_html=True)
 st.caption(f"3D cylindrical-array ultrasound acquisition and reconstruction, pure Python. Backend: {BACKEND_NAME}.")
+st.markdown("""<style>
+/* keep stale elements fully opaque during reruns: the progress bar is the
+   activity indicator, the page should never dim like it froze */
+[data-stale="true"] { opacity: 1 !important; }
+.element-container.stale-element { opacity: 1 !important; }
+div[data-testid="stAppViewContainer"] .element-container {
+  transition: none !important; }
+</style>""", unsafe_allow_html=True)
 
 # Workflow-gated tabs: imaging/reconstruction only exist once an acquisition
 # has produced data, and the reconstruction methods offered depend on the
@@ -425,6 +433,42 @@ ch.onmessage = (e) => {
 };
 </script>
 """
+
+
+def _vol3d(vol, title, cmin, cmax, scale, zlab="deg"):
+    """Interactive 3D volume figure (exterior NaN renders as void)."""
+    import plotly.graph_objects as go
+    mm = np.arange(vol.shape[0]) * h * 1e3
+    zc, yc, xc = np.meshgrid(mm, mm, mm, indexing="ij")
+    v = np.nan_to_num(np.asarray(vol, float), nan=-1e3)
+    fig = go.Figure(go.Volume(
+        x=xc.ravel(), y=yc.ravel(), z=zc.ravel(), value=v.ravel(),
+        isomin=cmin, isomax=cmax, opacity=0.12, surface_count=15,
+        colorscale=scale, colorbar=dict(title=zlab),
+        caps=dict(x_show=False, y_show=False, z_show=False)))
+    fig.update_layout(title=title, height=380,
+                      margin=dict(l=0, r=0, t=36, b=0))
+    return fig
+
+
+def live_pair(true_key, make_true, make_cur):
+    """Live 3D view: LEFT the original (cached once), RIGHT the evolving
+    current estimate, re-rendered on every rerun of a running solver."""
+    c1, c2 = st.columns(2)
+    if true_key not in st.session_state:
+        st.session_state[true_key] = make_true()
+    with c1:
+        st.plotly_chart(st.session_state[true_key], width="stretch",
+                        key=f"lpt_{true_key}_{np.random.randint(10 ** 9)}")
+    with c2:
+        st.plotly_chart(make_cur(), width="stretch",
+                        key=f"lpc_{true_key}_{np.random.randint(10 ** 9)}")
+
+
+def _true_grain_fig():
+    return render3d.polycrystal_figure(
+        labels, np.degrees(np.arccos(np.clip(np.abs(axes3[:, 2]), 0, 1))),
+        h, "Original (true) grains", vmin=0, vmax=90)
 
 
 def live_panel(slice2d, title, hist=None, zlab="deg", zmin=0.0, zmax=90.0,
@@ -1133,10 +1177,14 @@ if tab_fwi is not None:
             fjob = st.session_state.get("fwi_job")
             if fjob is not None and fjob.get("m") is not None:
                 try:
-                    live_panel(phantom.m_to_velocity(fjob["m"])[n // 2],
-                               f"Live: velocity model, iteration {fjob.get('it', 0)}",
-                               hist=fjob.get("hist"), zlab="m/s",
-                               zmin=float(vlo), zmax=float(vhi), cmap="Viridis")
+                    live_pair(f"lt_fwi_{n}_{float(np.sum(c_true)):.4e}",
+                              lambda: _vol3d(c_true, "Original (true) model",
+                                             float(vlo), float(vhi), "Viridis",
+                                             "m/s"),
+                              lambda: _vol3d(phantom.m_to_velocity(fjob["m"]),
+                                             f"Current estimate (iteration {fjob.get('it', 0)})",
+                                             float(vlo), float(vhi), "Viridis",
+                                             "m/s"))
                 except Exception:
                     pass
             if fjob is not None:
@@ -1311,12 +1359,12 @@ if tab_fwi is not None:
                     if cjob is not None and cjob.get("axes") is not None:
                         try:
                             _pc = cof.params_from_axes(np.asarray(cjob["axes"]))
-                            _cm = np.full(labels.shape, np.nan)
-                            for _g in range(len(_pc)):
-                                _cm[labels == _g] = np.degrees(_pc[_g, 0])
-                            live_panel(_cm[n // 2],
-                                       f"Live: grain colatitudes ({cjob['phase']})",
-                                       hist=cjob.get("hist"), best=cjob.get("j_cur"))
+                            live_pair(f"lt_gr_{n}_{float(np.sum(axes3)):.4e}",
+                                      _true_grain_fig,
+                                      lambda: render3d.polycrystal_figure(
+                                          labels, np.degrees(_pc[:, 0]), h,
+                                          f"Current axes ({cjob['phase']})",
+                                          vmin=0, vmax=90))
                         except Exception:
                             pass
                     if cjob is not None:
@@ -1547,10 +1595,13 @@ if tab_fwi is not None:
                         ojob = None
                     if ojob is not None and ojob.get("colat") is not None:
                         try:
-                            _oc = np.where(labels >= 0, np.degrees(ojob["colat"]), np.nan)
-                            live_panel(_oc[n // 2],
-                                       f"Live: orientation field ({ojob['phase']})",
-                                       hist=ojob.get("hist"), best=ojob.get("bJ"))
+                            live_pair(f"lt_gr_{n}_{float(np.sum(axes3)):.4e}",
+                                      _true_grain_fig,
+                                      lambda: _vol3d(
+                                          np.where(labels >= 0,
+                                                   np.degrees(ojob["colat"]), np.nan),
+                                          f"Current field ({ojob['phase']})",
+                                          0.0, 90.0, "Twilight"))
                         except Exception:
                             pass
                     if ojob is not None:
@@ -1813,6 +1864,11 @@ if tab_fwi is not None:
                                    "volume shows only where the recovered axis is "
                                    "more than 5 deg wrong, so a correct inversion "
                                    "is an empty box.")
+                        try:
+                            live_panel(ores["colat_rec"][n // 2],
+                                       "Final mid-plane colatitude")
+                        except Exception:
+                            pass
                         fo = go.Figure(go.Scatter(y=ores["hist"],
                                                   mode="lines+markers"))
                         fo.update_yaxes(type="log", title="misfit")
@@ -1898,12 +1954,12 @@ if tab_fwi is not None:
                             try:
                                 _labN = vi.hard_labels(vjob["seeds"], vs_mask, h)
                                 _paN = cof.params_from_axes(np.asarray(vjob["axes"]))
-                                _cmN = np.full(vs_mask.shape, np.nan)
-                                for _g in range(len(_paN)):
-                                    _cmN[_labN == _g] = np.degrees(_paN[_g, 0])
-                                live_panel(_cmN[n // 2],
-                                           f"Live: Voronoi grains ({vjob['phase']})",
-                                           hist=vjob.get("hist"), best=vjob.get("bJ"))
+                                live_pair(f"lt_gr_{n}_{float(np.sum(axes3)):.4e}",
+                                          _true_grain_fig,
+                                          lambda: render3d.polycrystal_figure(
+                                              _labN, np.degrees(_paN[:, 0]), h,
+                                              f"Current grains ({vjob['phase']})",
+                                              vmin=0, vmax=90))
                             except Exception:
                                 pass
                         if vjob["polish"]:
@@ -2340,6 +2396,13 @@ if tab_fwi is not None:
                                                     yaxis_title="y (mm)",
                                                     zaxis_title="z (mm)"))
                         st.plotly_chart(fe, width="stretch")
+                        try:
+                            _slv = np.full(vres["labels"].shape, np.nan)
+                            for _g in range(len(vres["colat_deg"])):
+                                _slv[vres["labels"] == _g] = vres["colat_deg"][_g]
+                            live_panel(_slv[n // 2], "Final mid-plane colatitude")
+                        except Exception:
+                            pass
                         fv = go.Figure(go.Scatter(y=vres["hist"],
                                                   mode="lines+markers"))
                         fv.update_yaxes(type="log", title="misfit")
