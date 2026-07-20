@@ -427,6 +427,38 @@ ch.onmessage = (e) => {
 """
 
 
+def live_panel(slice2d, title, hist=None, zlab="deg", zmin=0.0, zmax=90.0,
+               cmap="Twilight", best=None):
+    """Live algorithm view: a mid-height slice plus the convergence curve.
+
+    Rendered fresh on every rerun of an incremental job, so the user watches
+    the model evolve while the solver runs. Cheap by construction (one 2D
+    heatmap + one line trace); wrapped in try/except at call sites so a
+    display hiccup can never kill a run.
+    """
+    import plotly.graph_objects as go
+    mmv = np.arange(slice2d.shape[0]) * h * 1e3
+    c1, c2 = st.columns([3, 2])
+    figL = go.Figure(go.Heatmap(
+        z=slice2d, x=mmv, y=mmv, colorscale=cmap, zmin=zmin, zmax=zmax,
+        colorbar=dict(title=zlab)))
+    figL.update_layout(title=title, height=280,
+                       margin=dict(l=10, r=10, t=36, b=10))
+    with c1:
+        st.plotly_chart(figL, width="stretch",
+                        key=f"live_{abs(hash(title)) % 10 ** 8}_{np.random.randint(1e9)}")
+    if hist is not None and len(hist) > 1:
+        figJ = go.Figure(go.Scatter(y=np.asarray(hist, float), mode="lines",
+                                    line=dict(color="#54a8d6")))
+        figJ.update_yaxes(type="log", title="misfit")
+        figJ.update_layout(
+            title=(f"best J {best:.3g}" if best is not None else "convergence"),
+            height=280, margin=dict(l=10, r=10, t=36, b=10))
+        with c2:
+            st.plotly_chart(figJ, width="stretch",
+                            key=f"livej_{abs(hash(title)) % 10 ** 8}_{np.random.randint(1e9)}")
+
+
 def progress_widget():
     """Client-side progress bar (rendered only in the browser build)."""
     if IN_BROWSER:
@@ -857,6 +889,24 @@ with tab_acq:
                         job.pop("wgpu_id", None)
                         job["wgpu_failed"] = True
                         st.rerun()
+            if 0 < job["i"] < total:
+                try:                        # live view: last acquired frame
+                    from scipy.signal import hilbert as _hil
+                    _d = job["data"][job["i"] - 1].T
+                    _env = np.abs(_hil(_d, axis=1))
+                    _env = 20 * np.log10(_env / (_env.max() + 1e-30) + 1e-6)
+                    import plotly.graph_objects as _go
+                    _f = _go.Figure(_go.Heatmap(
+                        z=_env, colorscale="Inferno", zmin=-40, zmax=0,
+                        colorbar=dict(title="dB")))
+                    _f.update_layout(
+                        title=f"Live: received frame, transmit {job['i']}",
+                        height=240, xaxis_title="sample",
+                        yaxis_title="rx element",
+                        margin=dict(l=10, r=10, t=36, b=10))
+                    st.plotly_chart(_f, width="stretch")
+                except Exception:
+                    pass
             if job["i"] < total:
                 elapsed = time.time() - job["t0"]
                 eta = elapsed / max(i, 1) * (total - i)
@@ -1081,6 +1131,14 @@ if tab_fwi is not None:
                 st.rerun()
 
             fjob = st.session_state.get("fwi_job")
+            if fjob is not None and fjob.get("m") is not None:
+                try:
+                    live_panel(phantom.m_to_velocity(fjob["m"])[n // 2],
+                               f"Live: velocity model, iteration {fjob.get('it', 0)}",
+                               hist=fjob.get("hist"), zlab="m/s",
+                               zmin=float(vlo), zmax=float(vhi), cmap="Viridis")
+                except Exception:
+                    pass
             if fjob is not None:
                 if fjob["sig"] != _fwi_sig:
                     del st.session_state.fwi_job
@@ -1250,6 +1308,17 @@ if tab_fwi is not None:
                         js_progress(done=True)
                         st.warning("Configuration changed during the COF inversion; run aborted.")
                         cjob = None
+                    if cjob is not None and cjob.get("axes") is not None:
+                        try:
+                            _pc = cof.params_from_axes(np.asarray(cjob["axes"]))
+                            _cm = np.full(labels.shape, np.nan)
+                            for _g in range(len(_pc)):
+                                _cm[labels == _g] = np.degrees(_pc[_g, 0])
+                            live_panel(_cm[n // 2],
+                                       f"Live: grain colatitudes ({cjob['phase']})",
+                                       hist=cjob.get("hist"), best=cjob.get("j_cur"))
+                        except Exception:
+                            pass
                     if cjob is not None:
                         ds = st.session_state.ds
                         src_sub = [src_list[i] for i in cjob["tx_sel"]]
@@ -1476,6 +1545,14 @@ if tab_fwi is not None:
                         st.warning("Configuration changed during the orientation-field "
                                    "inversion; run aborted.")
                         ojob = None
+                    if ojob is not None and ojob.get("colat") is not None:
+                        try:
+                            _oc = np.where(labels >= 0, np.degrees(ojob["colat"]), np.nan)
+                            live_panel(_oc[n // 2],
+                                       f"Live: orientation field ({ojob['phase']})",
+                                       hist=ojob.get("hist"), best=ojob.get("bJ"))
+                        except Exception:
+                            pass
                     if ojob is not None:
                         ds = st.session_state.ds
                         src_sub = [src_list[i] for i in ojob["tx_sel"]]
@@ -1817,6 +1894,18 @@ if tab_fwi is not None:
                         if vjob["seeds"] is None:
                             vjob["seeds"] = vi.kmeans_seeds(vs_mask, h, vs_g,
                                                             seed=int(seed))
+                        if vjob.get("seeds") is not None:
+                            try:
+                                _labN = vi.hard_labels(vjob["seeds"], vs_mask, h)
+                                _paN = cof.params_from_axes(np.asarray(vjob["axes"]))
+                                _cmN = np.full(vs_mask.shape, np.nan)
+                                for _g in range(len(_paN)):
+                                    _cmN[_labN == _g] = np.degrees(_paN[_g, 0])
+                                live_panel(_cmN[n // 2],
+                                           f"Live: Voronoi grains ({vjob['phase']})",
+                                           hist=vjob.get("hist"), best=vjob.get("bJ"))
+                            except Exception:
+                                pass
                         if vjob["polish"]:
                             lab_now = vi.hard_labels(vjob["seeds"], vs_mask, h)
                             res_fn = cof.make_residual(
