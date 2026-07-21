@@ -1368,7 +1368,6 @@ if tab_fwi is not None:
                     cjob = st.session_state.get("cof_job")
                     if cjob is not None and cjob["sig"] != _cof_sig:
                         del st.session_state.cof_job
-                        st.rerun()   # clear the live view; results render on a clean pass
                         js_progress(done=True)
                         st.warning("Configuration changed during the COF inversion; run aborted.")
                         cjob = None
@@ -1496,6 +1495,7 @@ if tab_fwi is not None:
                             axes=axes_rec, errs=errs, hist=list(cjob["hist"]),
                             evals=cjob["evals"], secs=time.time() - cjob["t0"])
                         del st.session_state.cof_job
+                        st.rerun()   # clear the live view; results render cleanly
 
                     cres = st.session_state.get("cof_result")
                     if cres is not None:
@@ -1606,7 +1606,6 @@ if tab_fwi is not None:
                     ojob = st.session_state.get("of_job")
                     if ojob is not None and ojob["sig"] != _of_sig:
                         del st.session_state.of_job
-                        st.rerun()   # clear the live view; results render on a clean pass
                         js_progress(done=True)
                         st.warning("Configuration changed during the orientation-field "
                                    "inversion; run aborted.")
@@ -1829,6 +1828,7 @@ if tab_fwi is not None:
                             hist=list(ojob["hist"]), evals=ojob["evals"],
                             secs=time.time() - ojob["t0"])
                         del st.session_state.of_job
+                        st.rerun()   # clear the live view; results render cleanly
 
                     ores = st.session_state.get("of_result")
                     if ores is not None:
@@ -1937,15 +1937,36 @@ if tab_fwi is not None:
                     progress_widget()
                     _vs_sig = (n, nt, int(seed), vs_tx, vs_g, vs_sa,
                                vs_lm, tuple(src_list))
-                    if st.button("Recover grains (seeds + axes)", type="primary",
-                                 disabled="vs_job" in st.session_state, key="vs_btn"):
+                    _vs_prev = st.session_state.get("vs_result")
+                    _vs_can_continue = (_vs_prev is not None
+                                        and _vs_prev.get("seeds") is not None
+                                        and len(_vs_prev["axes"]) == vs_g)
+                    vbc1, vbc2 = st.columns([1, 1])
+                    with vbc2:
+                        _vs_cont = (_vs_can_continue and st.button(
+                            "Continue from last result",
+                            disabled="vs_job" in st.session_state,
+                            key="vs_btn_cont",
+                            help="Warm-start the annealing from the previous "
+                                 "best seeds and axes; long searches compound "
+                                 "across runs instead of restarting."))
+                    with vbc1:
+                        _vs_fresh = st.button(
+                            "Recover grains (seeds + axes)", type="primary",
+                            disabled="vs_job" in st.session_state,
+                            key="vs_btn")
+                    if _vs_fresh or _vs_cont:
                         sel = np.linspace(0, len(src_list) - 1, vs_tx).astype(int)
                         st.session_state.vs_job = dict(
                             sig=_vs_sig, t0=time.time(), evals=0, est=vs_est,
                             tx_sel=[int(i) for i in dict.fromkeys(sel)],
                             phase="init", k=0, J0=None, Jc=None,
                             rng=np.random.default_rng(int(seed) + 1),
-                            seeds=None, axes=np.tile([0.0, 0.0, 1.0], (vs_g, 1)),
+                            seeds=(np.asarray(_vs_prev["seeds"], float).copy()
+                                   if _vs_cont else None),
+                            axes=(np.asarray(_vs_prev["axes"], float).copy()
+                                  if _vs_cont
+                                  else np.tile([0.0, 0.0, 1.0], (vs_g, 1))),
                             bseeds=None, baxes=None, bJ=None, hist=[],
                             lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
                                     J=None, Jac=None, col=0, trial=0),
@@ -1956,7 +1977,6 @@ if tab_fwi is not None:
                     vjob = st.session_state.get("vs_job")
                     if vjob is not None and vjob["sig"] != _vs_sig:
                         del st.session_state.vs_job
-                        st.rerun()   # clear the live view; results render on a clean pass
                         js_progress(done=True)
                         st.warning("Configuration changed during the Voronoi-seed "
                                    "inversion; run aborted.")
@@ -2380,6 +2400,7 @@ if tab_fwi is not None:
                                                         true_ax_map, vs_mask)
                         st.session_state.vs_result = dict(
                             labels=lab_f, axes=np.asarray(vjob["axes"]),
+                            seeds=np.asarray(vjob["seeds"]),
                             colat_deg=np.degrees(par_f[:, 0]),
                             err=np.where(vs_mask, errm, np.nan),
                             mean_err=float(errm[vs_mask].mean()),
@@ -2387,6 +2408,7 @@ if tab_fwi is not None:
                             hist=list(vjob["hist"]), evals=vjob["evals"],
                             secs=time.time() - vjob["t0"])
                         del st.session_state.vs_job
+                        st.rerun()   # clear the live view; results render cleanly
 
                     vres = st.session_state.get("vs_result")
                     if vres is not None:
