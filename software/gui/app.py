@@ -38,6 +38,32 @@ plt.rcParams.update({
 import streamlit as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Session persistence: acquisition + inversion results survive page
+# reloads (config-keyed; a saved state only restores when the current
+# widget configuration matches the one it was made with).
+SESS_DIR = os.path.join(HERE, "..", "..", ".session_cache")
+os.makedirs(SESS_DIR, exist_ok=True)
+
+
+def _cache_path(name):
+    return os.path.join(SESS_DIR, name)
+
+
+def _cache_sig_matches(name, sig):
+    try:
+        with open(_cache_path(name), "r", encoding="utf-8") as f:
+            return f.read() == repr(sig)
+    except OSError:
+        return False
+
+
+def _cache_write_sig(name, sig):
+    try:
+        with open(_cache_path(name), "w", encoding="utf-8") as f:
+            f.write(repr(sig))
+    except OSError:
+        pass
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "simulation"))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))
@@ -834,6 +860,24 @@ with tab_acq:
     # build, where a long synchronous computation blocks all UI updates).
     _acq_sig = (n, nt, n_elem, tuple(src_list), poly, el_shape)
     progress_widget()
+    if ("ds" not in st.session_state
+            and os.path.exists(_cache_path("acq.h5"))):
+        if _cache_sig_matches("acq.sig", _acq_sig):
+            if st.button("Restore saved acquisition",
+                         key="acq_restore"):
+                try:
+                    st.session_state.ds = Dataset.load(
+                        _cache_path("acq.h5"))
+                    st.session_state.hw = None
+                    st.session_state.src_list = src_list
+                    st.session_state.wavelet_eff = wavelet_rec
+                    st.rerun()
+                except Exception as _e:
+                    st.warning(f"Could not restore: {_e}")
+        else:
+            st.caption("A saved acquisition exists but was made with "
+                       "different settings; run a new acquisition or "
+                       "match the old configuration to restore it.")
     if st.button("Run acquisition", type="primary",
                  disabled="acq_job" in st.session_state):
         st.session_state.acq_job = dict(
@@ -1033,6 +1077,11 @@ with tab_acq:
             st.success(f"Acquired {data.shape[0]} transmits x {data.shape[1]} samples "
                        f"x {data.shape[2]} channels"
                        + (" | RX band-pass applied" if rx_filt_on else ""))
+            try:
+                st.session_state.ds.save(_cache_path("acq.h5"))
+                _cache_write_sig("acq.sig", _acq_sig)
+            except Exception:
+                pass
             # the tab bar was built before the dataset existed; rerun once so
             # the imaging/reconstruction tabs appear
             st.rerun()
@@ -1942,6 +1991,12 @@ if tab_fwi is not None:
                                                "forward evaluation per step.")
                     with vs4:
                         vs_lm = st.slider("LM iterations", 0, 6, 3, key="vs_lm")
+                    vs_endless = st.checkbox(
+                        "Run until stopped (ignore the step budget)",
+                        key="vs_endless",
+                        help="The annealing keeps going until you press Stop; "
+                             "the temperature keeps cooling and periodic restarts "
+                             "keep exploring, with the global best always kept.")
                     vs_est = (1 + vs_sa + vs_lm * (5 * vs_g + 3)
                               + 2 * (2 * vs_g + 3))
                     st.caption(f"About {vs_est} forward evaluations of {vs_tx} "
@@ -2000,6 +2055,9 @@ if tab_fwi is not None:
                         st.session_state.pop("vs_result", None)
                         st.rerun()
 
+                    if "vs_job" in st.session_state:
+                        if st.button("Stop and keep best", key="vs_btn_stop"):
+                            st.session_state.vs_job["stop_req"] = True
                     vjob = st.session_state.get("vs_job")
                     if vjob is not None and vjob["sig"] != _vs_sig:
                         del st.session_state.vs_job
@@ -2179,7 +2237,12 @@ if tab_fwi is not None:
 
                         try:
                             done = False
-                            if vjob["phase"] == "init":
+                            if vjob.get("stop_req"):
+                                if vjob.get("bseeds") is not None:
+                                    vjob["seeds"] = vjob["bseeds"].copy()
+                                    vjob["axes"] = vjob["baxes"].copy()
+                                done = True
+                            elif vjob["phase"] == "init":
                                 J0, _ = vJ(vi.params_pack(vjob["seeds"], vjob["axes"]))
                                 vjob["J0"] = J0; vjob["Jc"] = J0; vjob["bJ"] = J0
                                 vjob["bseeds"] = vjob["seeds"].copy()
@@ -2319,7 +2382,7 @@ if tab_fwi is not None:
                                 _chunk = 1 if use_wgpu else 6
                                 _seg = max(1, vs_sa // 3)
                                 for _c in range(_chunk):
-                                    if vjob["k"] >= vs_sa:
+                                    if (not vs_endless) and vjob["k"] >= vs_sa:
                                         break
                                     if (vjob["k"] > 0 and vjob["k"] % _seg == 0
                                             and vjob.get("rs_done", -1) < vjob["k"]):
@@ -2354,7 +2417,7 @@ if tab_fwi is not None:
                                     vjob["k"] += 1
                                     vjob["evals"] += 1
                                 vjob["evals"] -= 1      # outer loop adds one more
-                                if vjob["k"] >= vs_sa:
+                                if (not vs_endless) and vjob["k"] >= vs_sa:
                                     vjob["seeds"] = vjob["bseeds"].copy()
                                     vjob["axes"] = vjob["baxes"].copy()
                                     vjob["phase"] = "lm"
@@ -2456,8 +2519,33 @@ if tab_fwi is not None:
                             hist=list(vjob["hist"]), evals=vjob["evals"],
                             secs=time.time() - vjob["t0"])
                         del st.session_state.vs_job
+                        try:
+                            _vr = st.session_state.vs_result
+                            np.savez(_cache_path("vs_result.npz"),
+                                     **{k2: np.asarray(v2) for k2, v2 in _vr.items()
+                                        if k2 != "hist"},
+                                     hist=np.asarray(_vr["hist"], float))
+                            _cache_write_sig("vs.sig", _vs_sig)
+                        except Exception:
+                            pass
                         st.rerun()   # clear the live view; results render cleanly
 
+                    if (st.session_state.get("vs_result") is None
+                            and os.path.exists(_cache_path("vs_result.npz"))
+                            and _cache_sig_matches("vs.sig", _vs_sig)):
+                        try:
+                            _z = np.load(_cache_path("vs_result.npz"),
+                                         allow_pickle=False)
+                            st.session_state.vs_result = dict(
+                                labels=_z["labels"], axes=_z["axes"],
+                                seeds=_z["seeds"], colat_deg=_z["colat_deg"],
+                                err=_z["err"], mean_err=float(_z["mean_err"]),
+                                max_err=float(_z["max_err"]),
+                                hist=[float(x) for x in _z["hist"]],
+                                evals=int(_z["evals"]), secs=float(_z["secs"]))
+                            st.caption("Restored the previous inversion result from disk.")
+                        except Exception:
+                            pass
                     vres = st.session_state.get("vs_result")
                     if vres is not None:
                         import plotly.graph_objects as go
