@@ -1955,7 +1955,7 @@ if tab_fwi is not None:
                     _vs_can_continue = (_vs_prev is not None
                                         and _vs_prev.get("seeds") is not None
                                         and len(_vs_prev["axes"]) == vs_g)
-                    vbc1, vbc2 = st.columns([1, 1])
+                    vbc1, vbc2, vbc3 = st.columns([1, 1, 1])
                     with vbc2:
                         _vs_cont = (_vs_can_continue and st.button(
                             "Continue from last result",
@@ -1969,7 +1969,16 @@ if tab_fwi is not None:
                             "Recover grains (seeds + axes)", type="primary",
                             disabled="vs_job" in st.session_state,
                             key="vs_btn")
-                    if _vs_fresh or _vs_cont:
+                    with vbc3:
+                        _vs_ref = (_vs_can_continue and st.button(
+                            "Refine weakest grains",
+                            disabled="vs_job" in st.session_state,
+                            key="vs_btn_ref",
+                            help="Probe each grain with trial axes to find the misfit "
+                                 "ones, then anneal ONLY those while the well-fit "
+                                 "grains stay frozen -- the efficient endgame when "
+                                 "most of the volume is already right."))
+                    if _vs_fresh or _vs_cont or _vs_ref:
                         sel = np.linspace(0, len(src_list) - 1, vs_tx).astype(int)
                         st.session_state.vs_job = dict(
                             sig=_vs_sig, t0=time.time(), evals=0, est=vs_est,
@@ -1977,10 +1986,13 @@ if tab_fwi is not None:
                             phase="init", k=0, J0=None, Jc=None,
                             rng=np.random.default_rng(int(seed) + 1),
                             seeds=(np.asarray(_vs_prev["seeds"], float).copy()
-                                   if _vs_cont else None),
+                                   if (_vs_cont or _vs_ref) else None),
                             axes=(np.asarray(_vs_prev["axes"], float).copy()
-                                  if _vs_cont
+                                  if (_vs_cont or _vs_ref)
                                   else np.tile([0.0, 0.0, 1.0], (vs_g, 1))),
+                                  refine=bool(_vs_ref), focus=None,
+                                  probe_g=0, probe_d=0,
+                                  probe_min=[float("inf")] * vs_g,
                             bseeds=None, baxes=None, bJ=None, hist=[],
                             lm=dict(it=0, sub="base", lam=1e-2, p=None, r=None,
                                     J=None, Jac=None, col=0, trial=0),
@@ -2153,7 +2165,9 @@ if tab_fwi is not None:
                         eta = el / max(vjob["evals"], 1) * max(vjob["est"] - vjob["evals"], 0)
                         _T = (vi.sa_temperature(vjob["k"], max(vs_sa, 1), vjob["J0"])
                               if vjob["phase"] == "anneal" and vjob["J0"] else None)
-                        msg = (f"Voronoi seeds [{vjob['phase']}"
+                        _foc_note = (f" refining {vjob['focus']}"
+                                     if vjob.get("focus") else "")
+                        msg = (f"Voronoi seeds [{vjob['phase']}{_foc_note}"
                                + (f" T={_T:.3g}" if _T is not None else "")
                                + f"]: evaluation "
                                f"{vjob['evals'] + 1}/~{vjob['est']}"
@@ -2173,13 +2187,31 @@ if tab_fwi is not None:
                                 vjob["hist"].append(J0)
                                 vjob["_pts"] = vi.mask_points(vs_mask, h)
                                 if vs_sa > 0:
-                                    vjob["phase"] = "anneal"
+                                    vjob["phase"] = ("probe" if vjob.get("refine") else "anneal")
                                 else:
                                     vjob["phase"] = "lm"
                                     vjob["lm"]["p"] = vi.params_pack(vjob["seeds"],
                                                                      vjob["axes"])
                                     if vs_lm == 0:
                                         vjob["lm"]["sub"] = "skip"
+                            elif vjob["phase"] == "probe":
+                                g_i, d_i = vjob["probe_g"], vjob["probe_d"]
+                                _at = np.asarray(vjob["axes"], float).copy()
+                                _at[g_i] = vi.PROBE_DIRS[d_i]
+                                Jt, _ = vJ(vi.params_pack(vjob["seeds"], _at))
+                                if Jt < vjob["probe_min"][g_i]:
+                                    vjob["probe_min"][g_i] = Jt
+                                vjob["probe_d"] += 1
+                                if vjob["probe_d"] >= len(vi.PROBE_DIRS):
+                                    vjob["probe_d"] = 0
+                                    vjob["probe_g"] += 1
+                                    if vjob["probe_g"] >= vs_g:
+                                        _marg = np.asarray(vjob["probe_min"]) - vjob["J0"]
+                                        _foc = [int(x) for x in range(vs_g) if _marg[x] < 0]
+                                        if not _foc:
+                                            _foc = [int(x) for x in np.argsort(_marg)[:2]]
+                                        vjob["focus"] = _foc
+                                        vjob["phase"] = "anneal"
                             elif vjob["phase"] == "anneal" and use_wgpu:
                                 # whole annealing loop as ONE main-thread GPU job --
                                 # no per-step rerun tax (the browser speed fix)
@@ -2218,7 +2250,8 @@ if tab_fwi is not None:
                                         dobs_sub, _wtr / _trn, _sos,
                                         vjob["seeds"].ravel(),
                                         np.asarray(vjob["axes"]).ravel(),
-                                        vs_sa, int(seed) + 1, tau_end=0.5, restarts=3)
+                                        vs_sa, int(seed) + 1, tau_end=0.5, restarts=3,
+                                        focus=vjob.get("focus"))
                                     vjob["sa_t0"] = time.time()
                                     st.rerun()
                                 _sst = webgpu_elastic.poll(vjob["sa_id"])
@@ -2292,7 +2325,7 @@ if tab_fwi is not None:
                                             and vjob.get("rs_done", -1) < vjob["k"]):
                                         # restart: fresh random chain, global best kept
                                         vjob["rs_done"] = vjob["k"]
-                                        for _g in range(vs_g):
+                                        for _g in (vjob.get("focus") or range(vs_g)):
                                             _q = int(rng.integers(len(vjob["_pts"])))
                                             vjob["seeds"][_g] = vjob["_pts"][_q]
                                             vjob["axes"][_g] = vi.random_axis(rng)
@@ -2302,7 +2335,8 @@ if tab_fwi is not None:
                                         # must see the SAME move on every rerun
                                         vjob["prop"] = vi.sa_move(
                                             vjob["seeds"], vjob["axes"],
-                                            vjob["_pts"], h, rng)[:2]
+                                            vjob["_pts"], h, rng,
+                                            focus=vjob.get("focus"))[:2]
                                     s_t, a_t = vjob["prop"]
                                     Jt, _ = vJ(vi.params_pack(s_t, a_t))
                                     vjob["prop"] = None

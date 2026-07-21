@@ -368,6 +368,7 @@ globalThis.__oueSA = function (id, cfg) {
       const tau0 = cfg.tau || 1.5;
       const tauEnd = cfg.tauEnd || tau0;
       const restarts = Math.max(1, cfg.restarts || 1);
+      const focus = (cfg.focus && cfg.focus.length) ? cfg.focus : null;
 
       const pipe = __oueEnsurePipes(dev, nt);
       const mk = (sz, usage) => dev.createBuffer({ size: sz, usage: usage });
@@ -529,7 +530,8 @@ globalThis.__oueSA = function (id, cfg) {
                                      k / Math.max(cfg.steps - 1, 1));
         if (k > 0 && k % segLen === 0) {
           // restart: fresh random chain, global best kept
-          for (let g2 = 0; g2 < G; g2++) {
+          const rsList = focus || Array.from({length: G}, (_, i2) => i2);
+          for (const g2 of rsList) {
             const q = Math.floor(rng() * P);
             seeds[g2] = [px[q], py[q], pz[q]];
             axes[g2] = norm3([gauss(), gauss(), Math.abs(gauss())]);
@@ -538,7 +540,8 @@ globalThis.__oueSA = function (id, cfg) {
           Jc = J_of(await forward());
         }
         const sT = clone(seeds), aT = clone(axes);
-        const g = Math.floor(rng() * G);
+        const g = focus ? focus[Math.floor(rng() * focus.length)]
+                        : Math.floor(rng() * G);
         const u = rng();
         if (u < 0.30) {
           const a = aT[g];
@@ -834,7 +837,7 @@ def result(job_id, B, nt, n_rx):
 
 def sa_start(shape, mat_base, cells, px, py, pz, base6, h, dt, nt, tau,
              wavelet, src_cells, rec_lin, dobs, W, sos, seeds0, axes0,
-             steps, rng_seed, tau_end=0.5, restarts=3):
+             steps, rng_seed, tau_end=0.5, restarts=3, focus=None):
     """Launch the ENTIRE annealing loop as one main-thread job.
 
     The main thread does proposals, soft-Voronoi model building, batched GPU
@@ -857,6 +860,7 @@ def sa_start(shape, mat_base, cells, px, py, pz, base6, h, dt, nt, tau,
         B=int(len(src_cells)), nt=int(nt), nrx=int(len(rec_lin)), G=G,
         invh=float(1.0 / h), dt=float(dt), h=float(h), tau=float(tau),
         tauEnd=float(tau_end), restarts=int(restarts),
+        focus=[int(g) for g in (focus or [])],
         steps=int(steps), rngSeed=int(rng_seed) & 0x7FFFFFFF,
         matBase=np.asarray(mat_base, np.float32).ravel().tobytes(),
         cells=np.asarray(cells, np.uint32).tobytes(),

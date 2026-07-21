@@ -177,18 +177,23 @@ def random_axis(rng):
     return v / np.linalg.norm(v)
 
 
-def sa_move(seeds, axes, pts, h, rng):
+def sa_move(seeds, axes, pts, h, rng, focus=None):
     """One random annealing proposal; returns (seeds', axes', kind).
 
     Move mix: local axis rotation, global axis redraw, local seed jitter,
     global seed teleport (to a random specimen voxel), axis swap between two
-    grains. Local moves refine; global moves hop basins.
+    grains. Local moves refine; global moves hop basins. ``focus`` restricts
+    the mutated grain to a subset (refinement of the weakest grains while
+    the well-fit ones stay frozen).
     """
     G = len(seeds)
     seeds = np.asarray(seeds, float).copy()
     axes = np.asarray(axes, float).copy()
     u = rng.random()
-    g = int(rng.integers(G))
+    if focus:
+        g = int(focus[int(rng.integers(len(focus)))])
+    else:
+        g = int(rng.integers(G))
     if u < 0.30:                                   # local axis rotation
         a = axes[g] + 0.26 * rng.standard_normal(3)     # ~15 deg
         if a[2] < 0:
@@ -223,3 +228,10 @@ def sa_tau(k, n_steps, tau0=1.5, tau_end=0.5):
     final search no longer pays the soft-model misfit floor."""
     r = tau_end / tau0
     return tau0 * (r ** (k / max(n_steps - 1, 1)))
+
+
+PROBE_DIRS = np.array([[0.0, 0.0, 1.0],
+                       [0.9428, 0.0, 0.3333],
+                       [-0.4714, 0.8165, 0.3333],
+                       [-0.4714, -0.8165, 0.3333]])
+"""Tetrahedral spread of trial c-axes for the weak-grain probe."""
