@@ -2045,7 +2045,7 @@ if tab_fwi is not None:
                             axes=(np.asarray(_vs_prev["axes"], float).copy()
                                   if (_vs_cont or _vs_ref)
                                   else np.tile([0.0, 0.0, 1.0], (vs_g, 1))),
-                                  refine=bool(_vs_ref), focus=None,
+                                  refine=bool(_vs_ref), focus=None, warm=bool(_vs_cont or _vs_ref),
                                   probe_g=0, probe_d=0,
                                   probe_min=[float("inf")] * vs_g,
                             bseeds=None, baxes=None, bJ=None, hist=[],
@@ -2095,8 +2095,12 @@ if tab_fwi is not None:
                                 filter_fn=lambda d: apply_rx_filter(d, axis=1))
                         else:
                             lab_now = None
-                            _tau_now = (vi.sa_tau(vjob["k"], max(vs_sa, 1))
-                                        if vjob["phase"] in ("init", "anneal") else 0.5)
+                            # constant blending during the search: annealing tau made J
+                            # values incomparable across the run, so "best" could lock
+                            # onto an early soft state; sharpening now happens only in
+                            # the LM/polish endgame where each stage is self-consistent
+                            _tau_now = (1.5 if vjob["phase"] in ("init", "probe", "anneal")
+                                        else 0.5)
                             res_fn = vi.make_residual_seeds(
                                 vs_mask, ring, h, dt, nt, wavelet, src_sub, dobs_sub,
                                 material=material, tau_voxels=_tau_now,
@@ -2313,8 +2317,9 @@ if tab_fwi is not None:
                                         dobs_sub, _wtr / _trn, _sos,
                                         vjob["seeds"].ravel(),
                                         np.asarray(vjob["axes"]).ravel(),
-                                        vs_sa, int(seed) + 1, tau_end=0.5, restarts=3,
-                                        focus=vjob.get("focus"))
+                                        vs_sa, int(seed) + 1, tau_end=1.5,
+                                        focus=vjob.get("focus"),
+                                        restarts=(1 if vjob.get("warm") else 3))
                                     vjob["sa_t0"] = time.time()
                                     st.rerun()
                                 _sst = webgpu_elastic.poll(vjob["sa_id"])
@@ -2385,7 +2390,8 @@ if tab_fwi is not None:
                                     if (not vs_endless) and vjob["k"] >= vs_sa:
                                         break
                                     if (vjob["k"] > 0 and vjob["k"] % _seg == 0
-                                            and vjob.get("rs_done", -1) < vjob["k"]):
+                                            and vjob.get("rs_done", -1) < vjob["k"]
+                                                and not vjob.get("warm")):
                                         # restart: fresh random chain, global best kept
                                         vjob["rs_done"] = vjob["k"]
                                         for _g in (vjob.get("focus") or range(vs_g)):
