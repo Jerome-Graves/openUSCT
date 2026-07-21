@@ -143,11 +143,13 @@ with tab_arr:
     ca1, ca2 = st.columns(2)
     with ca1:
         st.subheader("Array (3D cylinder)")
-        per_ring = st.slider("Elements per ring", 6, 16, 8, 1)
-        n_rings = st.slider("Rings", 1, 4, 3, 1)
+        per_ring = st.slider("Elements per ring", 6, 24, 16, 1,
+                             help="Half-wavelength azimuthal sampling wants ~2*pi*R / (lambda/2) elements: about 16-20 at these frequencies.")
+        n_rings = st.slider("Rings", 1, 8, 5, 1,
+                            help="Rings should span the whole specimen with about half-to-one wavelength axial spacing; gaps at the top and bottom leave those regions poorly constrained.")
         radius_mm = st.slider("Ring radius (mm)", 6, 16, 10)
         if n_rings > 1:
-            height_mm = st.slider("Axial span (mm)", 6, 18, 12)
+            height_mm = st.slider("Axial span (mm)", 6, 30, 26)
         else:
             height_mm = 0
             st.caption("A single ring sits on the mid-plane; axial span does not apply.")
