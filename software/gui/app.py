@@ -1257,6 +1257,7 @@ if tab_fwi is not None:
                     st.session_state.rec = (phantom.m_to_velocity(fjob["m"]),
                                             fjob["hist"])
                     del st.session_state.fwi_job
+                    st.rerun()   # clear the live view; results render on a clean pass
             if "rec" in st.session_state:
                 import plotly.graph_objects as go
                 from plotly.subplots import make_subplots
@@ -1367,6 +1368,7 @@ if tab_fwi is not None:
                     cjob = st.session_state.get("cof_job")
                     if cjob is not None and cjob["sig"] != _cof_sig:
                         del st.session_state.cof_job
+                        st.rerun()   # clear the live view; results render on a clean pass
                         js_progress(done=True)
                         st.warning("Configuration changed during the COF inversion; run aborted.")
                         cjob = None
@@ -1604,6 +1606,7 @@ if tab_fwi is not None:
                     ojob = st.session_state.get("of_job")
                     if ojob is not None and ojob["sig"] != _of_sig:
                         del st.session_state.of_job
+                        st.rerun()   # clear the live view; results render on a clean pass
                         js_progress(done=True)
                         st.warning("Configuration changed during the orientation-field "
                                    "inversion; run aborted.")
@@ -1953,6 +1956,7 @@ if tab_fwi is not None:
                     vjob = st.session_state.get("vs_job")
                     if vjob is not None and vjob["sig"] != _vs_sig:
                         del st.session_state.vs_job
+                        st.rerun()   # clear the live view; results render on a clean pass
                         js_progress(done=True)
                         st.warning("Configuration changed during the Voronoi-seed "
                                    "inversion; run aborted.")
