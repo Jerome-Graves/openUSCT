@@ -1091,17 +1091,29 @@ with tab_acq:
                            "the simulated acquisition after ADC quantisation.")
             with c2:
                 t_us_hw = np.arange(cnt) / ds.sample_rate_hz * 1e6
-                vmax_hw = float(np.abs(rtl[0]).max()) + 1e-30
+                # per-channel dB envelope: every element's arrival is visible
+                # regardless of its distance from the transmitter (a raw
+                # linear scale is dominated by the nearest channel)
+                from scipy.signal import hilbert as _hilb
+                _env = np.abs(_hilb(rtl[0].astype(float), axis=1))
+                _env_db = 20.0 * np.log10(
+                    _env / (_env.max(axis=1, keepdims=True) + 1e-30) + 1e-6)
                 fig = go.Figure(go.Heatmap(
-                    z=rtl[0], x=t_us_hw, y=np.arange(rtl.shape[1]),
-                    colorscale="RdBu", zmin=-vmax_hw, zmax=vmax_hw,
-                    colorbar=dict(title="ADC counts"),
-                    hovertemplate="t %{x:.2f} us | ch %{y} | %{z} counts<extra></extra>"))
+                    z=_env_db, x=t_us_hw, y=np.arange(rtl.shape[1]),
+                    colorscale="Inferno", zmin=-40, zmax=0,
+                    colorbar=dict(title="dB"),
+                    hovertemplate="t %{x:.2f} us | ch %{y} | "
+                                  "%{z:.1f} dB<extra></extra>"))
                 fig.update_layout(
-                    title="FPGA RTL-captured frame (transmit 0), quantised amplitude",
+                    title="FPGA RTL-captured frame (transmit 0), per-channel "
+                          "envelope [dB]",
                     xaxis_title="time (us)", yaxis_title="capture channel",
                     height=320, margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fig, width="stretch")
+                st.caption("Bright ridges are wave arrivals at each capture "
+                           "channel, exactly as the RTL streamed them; the "
+                           "bit-exact check on the left is the hardware "
+                           "verification.")
         else:
             st.info("The FPGA capture stage runs automatically with every acquisition "
                     "(requires Icarus Verilog).")
