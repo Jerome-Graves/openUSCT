@@ -27,8 +27,6 @@ are designed as one system:
   The whole app runs client-side (Python compiled to WebAssembly); on Chrome
   or Edge the acoustic acquisition executes on **your GPU via WebGPU**, with a
   live parity check against the CPU reference.
-* **Hosted demo (no install, server-side):**
-  [open-usct.streamlit.app](https://open-usct.streamlit.app/).
 * **Locally, at full speed** (C++ core, CUDA if available):
 
 ```bash
@@ -153,15 +151,6 @@ front-end, a processing stack in the language they already work in, and a
 verified simulator to prototype against. Applications include non-destructive
 testing, ultrasound computed tomography, and cylindrical-specimen imaging
 such as ice cores (crystal-orientation-fabric estimation).
-
-## Independence and the UARP format
-
-OpenUSCT is an independent, clean-room project. It is **not affiliated with,
-or endorsed by**, the Ultrasound Array Research Platform (UARP) or the IRASS
-Ultrasound Research Group at the University of Leeds. OpenUSCT reads and
-writes the UARP/UDSP data format for interoperability (conforming to the
-published schema), but it contains none of their source code and is not
-derived from their software.
 
 ## License
 
