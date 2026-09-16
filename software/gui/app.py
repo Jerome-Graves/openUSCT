@@ -126,7 +126,8 @@ st.markdown(
     '<svg width="52" height="52" viewBox="0 0 512 512" style="flex:0 0 auto;" xmlns="http://www.w3.org/2000/svg"><g transform="translate(256,256)"><circle r="226" fill="none" stroke="#2f7fb8" stroke-width="30"/><path d="M 0 -168 C 20 -58 58 -20 168 0 C 58 20 20 58 0 168 C -20 58 -58 20 -168 0 C -58 -20 -20 -58 0 -168 Z" fill="#54a8d6" stroke="#1b4f72" stroke-width="10" stroke-linejoin="round"/><circle r="30" fill="#eaf4fa"/></g></svg>'
     '<span style="font-size:2.4rem;font-weight:700;">OpenUSCT Studio</span>'
     "</div>", unsafe_allow_html=True)
-st.caption(f"3D cylindrical-array ultrasound acquisition and reconstruction, pure Python. Backend: {BACKEND_NAME}.")
+st.caption(f"3D cylindrical-array ultrasound acquisition and reconstruction, pure Python. Backend: {BACKEND_NAME}. "
+           "By [Jerome Graves](https://jeromegraves.com/), founder of [BugBotLab](https://www.bugbotlab.com/).")
 st.markdown("""<style>
 /* keep stale elements fully opaque during reruns: the progress bar is the
    activity indicator, the page should never dim like it froze */
